@@ -205,7 +205,7 @@ class Lamp:
 
 
 def discover(timeout: float = DEFAULT_TIMEOUT) -> list[Found]:
-    """Every lamp announcing itself on this subnet.
+    """Every lamp announcing itself on this subnet, one entry per lamp.
 
     mDNS does not cross VLANs or a guest network, so this only sees lamps the
     calling machine shares a subnet with. An unprovisioned lamp is not on the
@@ -214,7 +214,37 @@ def discover(timeout: float = DEFAULT_TIMEOUT) -> list[Found]:
     lamps = _discover_zeroconf(timeout)
     if lamps is None:
         lamps = _discover_cli(timeout)
-    return sorted(lamps, key=lambda lamp: lamp.label.lower())
+    return sorted(_dedupe(lamps), key=lambda lamp: lamp.label.lower())
+
+
+def _dedupe(lamps: list[Found]) -> list[Found]:
+    """One entry per address.
+
+    A lamp that has been renamed keeps answering to its old service name until
+    those records expire, and a browse sees every one of them -- three entries
+    for one lamp, all resolving to the same address. That is not cosmetic: it
+    made `update --all` fire three OTA installs at a single lamp, and the second
+    one timed out because the first had already taken it off the network to
+    download.
+
+    The address is what identifies a lamp here, not the name it is announcing
+    under. Entries that carry a friendly name win, since those come from current
+    firmware; the shortest name breaks a remaining tie, which prefers
+    "castor-lamp" over the older "castor-lamp-051860".
+    """
+    best: dict[str, Found] = {}
+    for lamp in lamps:
+        key = lamp.address or lamp.hostname
+        current = best.get(key)
+        if current is None:
+            best[key] = lamp
+            continue
+        if bool(lamp.name) != bool(current.name):
+            if lamp.name:
+                best[key] = lamp
+        elif len(lamp.hostname) < len(current.hostname):
+            best[key] = lamp
+    return list(best.values())
 
 
 def _discover_zeroconf(timeout: float) -> list[Found] | None:
@@ -307,9 +337,15 @@ def _discover_dns_sd(timeout: float) -> list[Found]:
 
     # dns-sd -Z does not resolve addresses, so each name still needs a lookup;
     # without it every request would pay the .local resolution cost instead.
+    #
+    # A name that resolves to nothing is a stale service record -- a lamp that
+    # has since been renamed, whose old announcement has not expired yet. It is
+    # dropped rather than carried forward with the hostname as a fallback: that
+    # fallback produced entries that could never be reached, and `--all` then
+    # failed on a ghost instead of acting on the lamps that are actually there.
     for lamp in lamps:
         lamp.address = _resolve_dns_sd(lamp.hostname, timeout=2.0)
-    return lamps
+    return [lamp for lamp in lamps if lamp.address]
 
 
 def _resolve_dns_sd(hostname: str, timeout: float) -> str:

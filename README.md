@@ -292,6 +292,7 @@ the air.
 | [docs/mqtt.md](docs/mqtt.md) | The MQTT message API: topics, payloads, discovery |
 | [docs/home-assistant.md](docs/home-assistant.md) | Home Assistant configuration |
 | [docs/home-assistant-control.md](docs/home-assistant-control.md) | Why MQTT rather than REST from Home Assistant |
+| [docs/wiki.mediawiki](docs/wiki.mediawiki) | The whole project as one page, in MediaWiki syntax, for pasting into a wiki |
 
 Each lamp also serves its own REST reference at `http://<lamp>/help`, and the
 same thing as JSON at `/api` — those describe the firmware actually running.

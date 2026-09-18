@@ -504,14 +504,35 @@ def main(argv=None) -> int:
             found = discover(args.timeout)
             if args.json:
                 print(json.dumps([f.__dict__ for f in found], indent=2))
-            elif not found:
+                return 0
+            if not found:
                 print("No lamps found.")
                 print("mDNS does not cross VLANs or a guest network, and an unprovisioned")
                 print("lamp is not on your network at all -- look for its setup AP instead.")
-            else:
-                for f in found:
-                    version = f" v{f.version}" if f.version else ""
-                    print(f"{f.label:<20} {f.url:<28} {f.hostname}{version}")
+                return 0
+
+            # Each lamp is asked what it is rather than reported from its mDNS
+            # TXT records alone: the records can be stale, and the name someone
+            # gave the lamp is worth more than the hostname it answers to.
+            for f in found:
+                try:
+                    status = Lamp(f.url).status()
+                except LampError:
+                    status = None
+
+                name = (status or {}).get("name") or f.label
+                version = (status or {}).get("version") or f.version
+                line = f"{name:<20} {f.url:<30} {'v' + version if version else '?':<8}"
+                if status is None:
+                    line += " not answering"
+                else:
+                    ota = status.get("ota", {})
+                    if ota.get("available"):
+                        line += f" update to v{ota.get('latest')} available"
+                    mq = status.get("mqtt", {})
+                    if mq.get("enabled") and not mq.get("connected"):
+                        line += " mqtt not connected"
+                print(line.rstrip())
             return 0
 
         lamps = _targets(args)

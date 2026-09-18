@@ -1,0 +1,306 @@
+= Glow Lamp =
+
+A ring of 8 addressable LEDs driven by an ESP32-C3. WiFi is provisioned through
+a captive portal, the lamp is controlled over a REST API and over MQTT, and the
+firmware updates itself from GitHub releases.
+
+Source: [https://github.com/brennanMKE/GlowLamp brennanMKE/GlowLamp]
+
+== Hardware ==
+
+{| class="wikitable"
+! Part !! Detail
+|-
+| Board || ESP32-C3 (<code>esp32-c3-devkitm-1</code>)
+|-
+| Ring || WS2812B, 8 LEDs
+|-
+| Data pin || GPIO 4
+|-
+| Power || 5 V, capped in firmware at 500 mA
+|}
+
+Wire the ring's data line to GPIO 4 and share ground between the ring's supply
+and the ESP32-C3. At the default brightness of 64 the 8 LEDs are well inside the
+500 mA cap, so USB power is fine; run it near 255 and use a separate 5 V supply.
+
+=== The ring is one light ===
+
+This is the constraint the firmware is built around. Behind a diffuser, several
+colors an inch apart do not read as several colors &mdash; they mix into a muddy
+white. So the ring shows '''one color at a time''', and the effects differ in how
+that color changes over time rather than in where it sits on the ring.
+
+''Flicker'' is the deliberate exception: it relies on that mixing to look like a
+flame, and is meant to be given colors that are already close together.
+
+== Deployed lamps ==
+
+{| class="wikitable"
+! Name !! Hostname !! Location
+|-
+| Castor || <code>castor-lamp.local</code> ||
+|-
+| Pollux || <code>pollux-lamp.local</code> ||
+|}
+
+Each lamp has two names. The '''name''' is free text ("Castor"), shown in the UI
+and announced over mDNS, and changes take effect immediately. The '''hostname'''
+is the mDNS label, lowercase letters, digits and hyphens; the lamp answers at
+<code><hostname>.local</code> and needs a reboot to republish it.
+
+Give every lamp a distinct hostname. Two lamps sharing one would both answer to
+it, and nothing would report the conflict.
+
+== Finding a lamp ==
+
+Lamps announce <code>_glowlamp._tcp</code> on port 80 over mDNS.
+
+<syntaxhighlight lang="bash">
+./scripts/find_devices.sh                  # scan and report
+./scripts/glowlamp.py discover             # the same thing
+</syntaxhighlight>
+
+mDNS does not cross VLANs or a guest network, so this only finds lamps on the
+same subnet. An unprovisioned lamp is not on the network at all &mdash; look for
+its setup access point instead.
+
+== First-time setup ==
+
+# Power on an unprovisioned lamp. It raises an access point named <code><hostname>-Setup-XXXXXX</code>.
+# Join it; the captive portal opens.
+# Pick the network, enter the password, save. The lamp reboots and joins.
+# Find it with <code>./scripts/find_devices.sh</code> and open its page to set the name.
+
+WiFi credentials are never compiled into the firmware, so a release binary is
+safe to publish and any lamp can be re-provisioned in the field.
+
+== Web interface ==
+
+{| class="wikitable"
+! Path !! What
+|-
+| <code>/</code> || Status, and the controls: on/off, brightness, identify
+|-
+| <code>/settings</code> || Firmware updates, effects and colors, names, MQTT broker, reboot
+|-
+| <code>/help</code> || The REST API, documented by the lamp itself
+|-
+| <code>/api</code> || The same reference as JSON
+|-
+| <code>/wifi</code> || WiFi setup pages
+|}
+
+'''Identify''' blinks the ring white for a few seconds at a floor brightness, so a
+lamp dimmed to 5 in a bright room still announces itself. It overrides power and
+restores whatever was showing, so identifying a lamp that is off leaves it off.
+
+== Effects ==
+
+{| class="wikitable"
+! Effect !! What it does
+|-
+| <code>blend</code> || Holds on a color, then eases to the next. ''The default.''
+|-
+| <code>loop</code> || Walks the palette steadily, never resting on a color.
+|-
+| <code>flicker</code> || Similar colors mixing and guttering, like a flame. The one effect that lights the ring several colors at once.
+|-
+| <code>neon</code> || One color, steady, with the stutter of a failing neon tube.
+|}
+
+Up to '''5 colors'''. Colors are carried as hue and saturation rather than RGB, and
+transitions travel the short way around the color wheel: an RGB blend between
+two colors far apart on the wheel passes through gray and reads as dirty white
+on a WS2812B.
+
+An effect set over REST is '''temporary'''. It reverts to the default after 5
+minutes unless told otherwise, is capped at 8 hours, and does not survive a
+reboot &mdash; a lamp left mid-experiment finds its own way back. Anything set
+over MQTT does '''not''' expire, because Home Assistant is a controller rather than
+someone trying something out.
+
+== REST API ==
+
+Full reference: <code>docs/rest-api.md</code>, or <code>http://<lamp>/help</code> on the lamp itself.
+
+{| class="wikitable"
+! Method !! Path !! Body
+|-
+| GET || <code>/api/status</code> ||
+|-
+| POST || <code>/api/power</code> || <code>{"on": true &#124; false &#124; "toggle"}</code>
+|-
+| POST || <code>/api/brightness</code> || <code>{"value": 0-255}</code>
+|-
+| POST || <code>/api/identify</code> || <code>{"seconds": 1-60}</code>
+|-
+| POST || <code>/api/effect</code> || <code>{"effect": "...", "colors": [...], "seconds": 300}</code>
+|-
+| POST || <code>/api/effect/reset</code> ||
+|-
+| POST || <code>/api/name</code> || <code>{"name": "...", "hostname": "..."}</code>
+|-
+| POST || <code>/api/broker</code> || <code>{"host": "...", "port": 1883}</code>
+|-
+| POST || <code>/api/ota/check</code> ||
+|-
+| POST || <code>/api/ota/install</code> ||
+|-
+| POST || <code>/api/ota/update</code> ||
+|-
+| POST || <code>/api/reboot</code> ||
+|}
+
+<syntaxhighlight lang="bash">
+curl http://castor-lamp.local/api/status
+curl -X POST 'http://castor-lamp.local/api/power?on=false'
+curl -X POST 'http://castor-lamp.local/api/brightness?value=128'
+curl -X POST 'http://castor-lamp.local/api/effect?effect=neon&colors=ff0000,00ff00'
+</syntaxhighlight>
+
+'''A JSON body is only read when the request sets <code>Content-Type: application/json</code>.'''
+Curl's default content type is form-encoded, and a JSON document sent that way
+is discarded by the HTTP server before the firmware sees it &mdash; silently.
+Query parameters never have that problem.
+
+Anything that changes the lamp is POST only. There is no authentication: these
+are LAN devices, and anything that can reach one can control it.
+
+== MQTT ==
+
+Full reference: <code>docs/mqtt.md</code>.
+
+Set a broker and the lamp publishes a retained Home Assistant discovery config,
+appearing as <code>light.<name></code> with brightness, a color picker and the effect
+list &mdash; no YAML, no restart, no filesystem access to the Home Assistant host.
+
+<syntaxhighlight lang="bash">
+./scripts/glowlamp.py broker 192.168.1.10 --host castor-lamp.local
+</syntaxhighlight>
+
+{| class="wikitable"
+! Topic !! Direction !! Retained
+|-
+| <code>homeassistant/light/glowlamp_<mac>/config</code> || publish || yes
+|-
+| <code>glowlamp/<hostname>/state</code> || publish || yes
+|-
+| <code>glowlamp/<hostname>/availability</code> || publish || yes
+|-
+| <code>glowlamp/<hostname>/set</code> || subscribe || '''never'''
+|}
+
+Commands must never be retained: a retained command replays on every reconnect
+and pins the lamp to whatever was last sent.
+
+Command payloads use Home Assistant's JSON light schema. <code>state</code> must be the
+'''word''' <code>"ON"</code> or <code>"OFF"</code> &mdash; a boolean is accepted silently and never
+turns the lamp on.
+
+<syntaxhighlight lang="bash">
+mosquitto_pub -h broker -t glowlamp/castor-lamp/set -m '{"state":"ON","brightness":200}'
+mosquitto_pub -h broker -t glowlamp/castor-lamp/set -m '{"effect":"flicker"}'
+</syntaxhighlight>
+
+MQTT is optional and off by default. A lamp with no broker never connects and is
+fully usable over REST, which stays the interface for the scripts, identify and
+OTA.
+
+== Home Assistant automations ==
+
+''To be filled in.''
+
+<!--
+Reserved for the Home Assistant side: entity names, the automations that use
+them, scenes, dashboards, and how the lamps fit the wider house-off routine.
+
+Reference material already in the repo:
+  docs/home-assistant.md          configuration, REST and shell_command fallbacks
+  docs/home-assistant-control.md  why MQTT rather than REST from Home Assistant
+  docs/mqtt.md                    the topics and payloads these automations drive
+-->
+
+== Firmware updates ==
+
+Lamps update themselves from GitHub releases. A lamp checks 15 seconds after
+joining WiFi, once a day at 15:00 local, and whenever asked.
+
+<syntaxhighlight lang="bash">
+./scripts/find_devices.sh --update                     # every lamp with an update
+curl -X POST http://castor-lamp.local/api/ota/update   # one lamp: check, install if newer
+</syntaxhighlight>
+
+<code>/api/ota/update</code> is the scheduler's endpoint: it does nothing at all on a
+lamp that is current, so it is safe to fire at every lamp nightly.
+
+A lamp stops answering for 10&ndash;30 seconds while it downloads, then reboots.
+
+=== Cutting a release ===
+
+<syntaxhighlight lang="bash">
+# bump FIRMWARE_VERSION in src/version.h first, and commit
+./scripts/release.sh 0.0.6
+./scripts/find_devices.sh --update
+</syntaxhighlight>
+
+The script refuses to tag if the version does not match <code>src/version.h</code>, if the
+working tree is dirty, or if the binary would overflow the 1,966,080-byte OTA
+slot &mdash; a build that overflows uploads fine over USB and then fails silently
+over the air.
+
+'''Cut the release before flashing a new version by hand.''' Versions are compared by
+tag equality, not ordering, so a lamp running firmware newer than the latest
+release will quietly install the older one. That also makes re-tagging an older
+release a supported way to roll back.
+
+== Building ==
+
+<syntaxhighlight lang="bash">
+pio run                      # release, the build that ships
+pio run -e esp32c3-debug     # verbose logging, USB only
+pio run -t upload            # flash over USB
+pio device monitor           # 115200
+</syntaxhighlight>
+
+Copy <code>lib/Config/Config.h.sample</code> to <code>lib/Config/Config.h</code> before the first
+build. It is gitignored and holds the device name and the OTA repo; there are no
+secrets in it.
+
+== Troubleshooting ==
+
+{| class="wikitable"
+! Symptom !! Cause
+|-
+| Lamp not found by a scan || mDNS does not cross VLANs. An unprovisioned lamp is not on the network at all &mdash; look for its setup AP.
+|-
+| A scan lists lamps that do not exist || Stale mDNS records from a rename, cached by the browsing machine. They expire on their own.
+|-
+| <code>.local</code> name does not resolve || A cold mDNS cache can take longer to answer than a short HTTP timeout. The scripts resolve to an address first for this reason.
+|-
+| Entity never appears in Home Assistant || The lamp is not connected to the broker &mdash; check the MQTT line on its settings page.
+|-
+| Entity stuck "unavailable" || The lamp is down, or pointed at a different broker.
+|-
+| MQTT commands do nothing || <code>state</code> must be <code>"ON"</code>, not <code>true</code>.
+|-
+| Lamp reverts after every reconnect || A retained message on the command topic. Clear it with <code>mosquitto_pub -r -n -t glowlamp/<host>/set</code>.
+|-
+| Ring looks washed out or white || Colors too far apart on the wheel in ''flicker'', which mixes by design. Use colors that are close together.
+|}
+
+== Version history ==
+
+{| class="wikitable"
+! Version !! What
+|-
+| 0.0.1 || First build: blend between three colors, EasyWiFi, GitHub OTA
+|-
+| 0.0.2 || Check for updates without installing them
+|-
+| 0.0.3 || REST API, on/off, identify, names, help page, Home Assistant script
+|-
+| 0.0.4 || <code>/api/ota/update</code> for scheduled rollouts
+|-
+| 0.0.5 || Four effects, five-color palette, hue-based blending, bare hostnames, MQTT
+|}

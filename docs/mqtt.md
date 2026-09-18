@@ -1,108 +1,228 @@
-# MQTT
+# MQTT message API
 
-The lamp speaks MQTT so Home Assistant can treat it as an ordinary light. This
-is the interface to use from Home Assistant;
-[docs/home-assistant-control.md](home-assistant-control.md) is the reasoning,
-and the short version is that MQTT is the only option where **Home Assistant
-needs nothing done to it** — no YAML, no restart, no filesystem access.
+The complete pub/sub interface. [home-assistant-control.md](home-assistant-control.md)
+is the reasoning for having it; the short version is that MQTT is the only
+option where **Home Assistant needs nothing done to it** — no YAML, no restart,
+no filesystem access to the Home Assistant host.
 
-MQTT is optional. A lamp with no broker configured never connects and is fully
-usable over [REST](rest-api.md), which stays the interface for `glowlamp.py`,
-identify, and OTA.
+MQTT is optional and off by default. A lamp with no broker configured never
+connects and is fully usable over [REST](rest-api.md), which stays the interface
+for `glowlamp.py`, identify, and OTA.
 
-## Turning it on
+## Enabling
 
 Settings page → **Home Assistant** → broker address. Or:
 
 ```sh
 ./scripts/glowlamp.py broker 192.168.1.10 --host castor-lamp.local
 curl -X POST 'http://castor-lamp.local/api/broker?host=192.168.1.10&port=1883'
+curl -X POST 'http://castor-lamp.local/api/broker?host='        # turns MQTT off
 ```
 
-An empty host turns MQTT off. Changes take effect immediately — no reboot. The
-stored password is never echoed back, and sending an empty one leaves it alone,
-so the host can be changed without knowing it.
+Takes effect immediately, no reboot. The stored password is never echoed back in
+`/api/status`, and sending an empty one leaves it alone, so the broker address
+can be changed without knowing the password.
 
-The lamp appears in Home Assistant within a second or two as `light.<name>`,
-with brightness, a color picker and the effect list. Nothing has to be added to
-`configuration.yaml`.
+The lamp appears in Home Assistant within a second or two as `light.<name>`.
+
+## Connection
+
+| | |
+|---|---|
+| Client ID | `glowlamp_<mac>`, e.g. `glowlamp_44b176051860` |
+| Auth | Optional username/password; anonymous when no username is set |
+| TLS | **None.** Plain MQTT on the LAN, like the REST API |
+| QoS | 0, publish and subscribe |
+| Keepalive | PubSubClient's default, 15 s |
+| Reconnect | One attempt every 5 s, never blocking the LED loop |
+| Max packet | 1024 bytes, set on every connect |
+
+A lamp reconnects on its own after a broker restart and republishes discovery,
+availability and state each time — so a broker without persistence, which loses
+its retained messages on restart, recovers without anyone touching the lamps.
 
 ## Topics
 
-| Topic | Retained | What |
+`<hostname>` is the lamp's mDNS hostname, e.g. `castor-lamp`. `<mac>` is its MAC
+with no separators.
+
+| Topic | Direction | Retained | Payload |
+|---|---|---|---|
+| `homeassistant/light/glowlamp_<mac>/config` | publish | **yes** | Discovery config |
+| `glowlamp/<hostname>/state` | publish | **yes** | Current state |
+| `glowlamp/<hostname>/availability` | publish | **yes** | `online` / `offline` |
+| `glowlamp/<hostname>/set` | **subscribe** | **never** | Command |
+
+**Never retain a command.** A retained command replays on every reconnect, which
+pins the lamp to whatever was last sent and makes it impossible to control from
+anywhere else. This is not hypothetical — it is the stale-brightness bug already
+diagnosed on the GlowKitchen strips, where retained messages kept resetting the
+fleet. Discovery, state and availability are retained on purpose, so Home
+Assistant knows the lamp the moment it restarts.
+
+## Subscribe: `glowlamp/<hostname>/set`
+
+Home Assistant's JSON light schema. Any subset of the fields, in one message.
+
+```json
+{"state": "ON", "brightness": 200, "color": {"r": 255, "g": 0, "b": 0}, "effect": "neon"}
+```
+
+| Field | Type | Meaning |
 |---|---|---|
-| `homeassistant/light/glowlamp_<mac>/config` | yes | Discovery. Published on every connect. |
-| `glowlamp/<hostname>/state` | yes | Current state, as the JSON light schema. |
-| `glowlamp/<hostname>/set` | **no** | Commands in. |
-| `glowlamp/<hostname>/availability` | yes | `online` / `offline`. |
-
-**Commands are never retained, and must not be.** A retained command replays on
-every reconnect, which pins the lamp to whatever was last sent — the same
-mistake diagnosed on the GlowKitchen strips, where stale retained brightness
-messages kept resetting the fleet. Discovery, state and availability are
-retained, so Home Assistant knows the lamp the moment it restarts.
-
-The discovery topic is keyed by MAC, not by name, so renaming a lamp updates the
-existing entity instead of leaving a duplicate behind.
-
-## Commands
-
-Home Assistant's JSON light schema. Any subset of the fields, in one message:
+| `state` | `"ON"` / `"OFF"` | Power. Persisted, so it survives a power cut. |
+| `brightness` | 0–255 | Persisted. Independent of power. |
+| `effect` | `blend`, `loop`, `flicker`, `neon` | Keeps the current palette. |
+| `color` | `{"r":,"g":,"b":}` | **Replaces** the palette with this one color. |
 
 ```sh
 mosquitto_pub -h broker -t glowlamp/castor-lamp/set -m '{"state":"OFF"}'
 mosquitto_pub -h broker -t glowlamp/castor-lamp/set -m '{"state":"ON","brightness":200}'
-mosquitto_pub -h broker -t glowlamp/castor-lamp/set -m '{"state":"ON","effect":"neon"}'
+mosquitto_pub -h broker -t glowlamp/castor-lamp/set -m '{"effect":"flicker"}'
 mosquitto_pub -h broker -t glowlamp/castor-lamp/set -m '{"color":{"r":0,"g":0,"b":255}}'
 ```
 
-| Field | Effect |
+Ordering within a message: `brightness` first, then `color` and `effect`
+together, then `state`. So "turn on and set a color" in one message ends up on,
+whichever order the fields were written in.
+
+A state publish follows every accepted command, so a caller never has to ask
+what happened.
+
+### Validation
+
+Every field is validated independently, and anything unusable is ignored rather
+than partially applied. A bad field never prevents the good fields in the same
+message from landing.
+
+| Sent | Result |
 |---|---|
-| `state` | `"ON"` or `"OFF"`. The word, not a boolean — a boolean is accepted silently and never turns the entity on. |
-| `brightness` | 0–255. |
-| `effect` | One of `blend`, `loop`, `flicker`, `neon`. Keeps the current palette. |
-| `color` | `{"r":,"g":,"b":}`. Home Assistant's picker is one color, so it **replaces** the palette rather than joining it. |
+| Malformed JSON | Whole message ignored, logged |
+| `{}` | Nothing changes |
+| `{"state": true}` | **Ignored** — see below |
+| `{"effect": "chase"}` | Effect unchanged; other fields still apply |
+| `{"brightness": 999}` | Brightness unchanged; other fields still apply |
 
-State is applied last, so "turn on and set a color" in one message ends up on
-whichever order the fields arrived in.
+`state` must be the **word** `"ON"` or `"OFF"`, not a boolean. `{"state": true}`
+is accepted silently and never turns the lamp on, which is a miserable thing to
+debug — it is the single most common mistake with the JSON light schema.
 
-**Nothing set over MQTT expires.** An effect set from the REST API reverts to
-the default after five minutes by default; one set over MQTT does not. Home
-Assistant is a controller, not someone trying something out, and an effect that
-reverted on its own would leave the entity showing a state the lamp no longer
-has.
+### Not supported
 
-## State
+`transition`, `flash`, `color_temp`, `white`, `hs`/`xy` color, and effect
+parameters (speed, intensity, multi-color palettes). A palette of up to five
+colors is a REST-only feature; Home Assistant's light entity has one color
+picker, so MQTT sets one color. See [rest-api.md](rest-api.md#effects).
 
-Published on connect and whenever power, brightness, effect or the palette's
-first color changes — not per frame. The live color moves continuously under
-`blend`, and publishing that would be a message every 16 ms for a value nothing
-can act on, so the color reported is the palette's first entry: stable, and the
-one someone actually picked.
+## Publish: `glowlamp/<hostname>/state`
 
 ```json
 {"state":"ON","brightness":90,"color_mode":"rgb","color":{"r":255,"g":32,"b":0},"effect":"flicker"}
 ```
 
+| Field | Meaning |
+|---|---|
+| `state` | `"ON"` or `"OFF"` |
+| `brightness` | 0–255 |
+| `color_mode` | Always `"rgb"` |
+| `color` | The palette's **first** color, not the live one |
+| `effect` | The running effect |
+
+Published on connect, after every accepted command, and whenever power,
+brightness, effect or the palette's first color changes — **not per frame**. The
+live color moves continuously under `blend`, so publishing it would be a message
+every 16 ms for a value nothing can act on. The first palette entry is stable,
+and is the color someone actually picked.
+
 Changes made from the web UI or the REST API publish too, so Home Assistant
-follows along when someone turns a lamp off at the lamp.
+follows along when a lamp is changed at the lamp.
 
-## Availability
+## Publish: `glowlamp/<hostname>/availability`
 
-The lamp carries a last will, so a power cut or a dropped link marks the entity
-unavailable rather than leaving it frozen on its last known state.
+`online` on connect, `offline` otherwise. Registered as the connection's last
+will, so a power cut or a dropped link marks the entity unavailable rather than
+leaving it frozen on its last known state.
 
 A last will only fires on an **ungraceful** disconnect. Turning MQTT off, or
 moving a lamp to another broker, is a clean disconnect and suppresses it — so
-the lamp publishes `offline` itself before hanging up. Without that, switching
+the lamp publishes `offline` itself before hanging up. Without that, changing
 brokers left a permanently "available" ghost entity behind.
 
-## Notes
+## Publish: `homeassistant/light/glowlamp_<mac>/config`
 
-- **No TLS.** The connection is plain MQTT on the LAN, like the REST API.
-- `PubSubClient` defaults to a 256-byte limit for the *whole* packet and
-  silently drops anything larger — no callback, no log, no error. The discovery
-  config alone is ~600 bytes. The buffer is raised on every connect, because
-  unlike the server and callback it does not survive a reconnect.
-- Reconnection is one attempt every 5 seconds and never blocks: a broker that is
-  down must not cost the LED loop a frame.
+Published retained on every connect. This is what creates the entity; nothing
+needs to be added to `configuration.yaml`.
+
+```json
+{
+  "schema": "json",
+  "name": "Castor",
+  "unique_id": "glowlamp_44b176051860",
+  "state_topic": "glowlamp/castor-lamp/state",
+  "command_topic": "glowlamp/castor-lamp/set",
+  "availability_topic": "glowlamp/castor-lamp/availability",
+  "payload_available": "online",
+  "payload_not_available": "offline",
+  "brightness": true,
+  "supported_color_modes": ["rgb"],
+  "effect": true,
+  "effect_list": ["blend", "loop", "flicker", "neon"],
+  "device": {
+    "identifiers": ["glowlamp_44b176051860"],
+    "name": "Castor",
+    "manufacturer": "Glow Lamp",
+    "model": "Ring of 8",
+    "sw_version": "0.0.5",
+    "configuration_url": "http://castor-lamp.local/"
+  }
+}
+```
+
+`unique_id` is the MAC, not the name, so renaming a lamp **updates** the existing
+entity rather than creating a second one. `configuration_url` puts a link to the
+lamp's own settings page in Home Assistant's device panel.
+
+### Renaming
+
+The command and state topics are built from the hostname, so changing it moves
+them. The lamp republishes discovery pointing at the new topics, and Home
+Assistant follows — but the **old retained state topic is left behind** holding a
+final stale message. Nothing reads it, and it costs a few bytes on the broker.
+To clear it:
+
+```sh
+mosquitto_pub -h broker -r -n -t glowlamp/old-name/state
+mosquitto_pub -h broker -r -n -t glowlamp/old-name/availability
+```
+
+Removing a lamp from Home Assistant entirely means clearing its discovery topic
+the same way:
+
+```sh
+mosquitto_pub -h broker -r -n -t homeassistant/light/glowlamp_44b176051860/config
+```
+
+## MQTT and REST together
+
+Both interfaces drive the same lamp and both publish state, so they never
+disagree. One deliberate difference:
+
+**Nothing set over MQTT expires.** An effect set over REST reverts to the default
+after five minutes unless told otherwise; one set over MQTT does not. Home
+Assistant is a controller, not someone trying something out, and an effect that
+reverted on its own would leave the entity showing a state the lamp no longer
+has.
+
+## Watching and troubleshooting
+
+```sh
+mosquitto_sub -h broker -v -t 'glowlamp/#' -t 'homeassistant/light/glowlamp_+/config'
+```
+
+| Symptom | Cause |
+|---|---|
+| Entity never appears | No retained discovery — check the lamp shows `connected` on its settings page |
+| Entity is "unavailable" | Availability says `offline`: lamp is down, or on another broker |
+| Commands do nothing | Check `state` is the word `"ON"`, not `true` |
+| Lamp reverts after a reconnect | A **retained** command on the `set` topic. Clear it: `mosquitto_pub -r -n -t glowlamp/<host>/set` |
+| Nothing publishes at all | A payload over the 1024-byte buffer is dropped silently by PubSubClient; the lamp logs an error at ERROR level, visible in the release build |

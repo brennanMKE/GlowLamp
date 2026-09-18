@@ -284,6 +284,18 @@ working tree is dirty, or if the binary would overflow the 1,966,080-byte OTA
 slot — a build that overflows uploads fine over USB and then fails silently over
 the air.
 
+## Docs
+
+| | |
+|---|---|
+| [docs/rest-api.md](docs/rest-api.md) | The REST API: endpoints, status fields, effects |
+| [docs/mqtt.md](docs/mqtt.md) | The MQTT message API: topics, payloads, discovery |
+| [docs/home-assistant.md](docs/home-assistant.md) | Home Assistant configuration |
+| [docs/home-assistant-control.md](docs/home-assistant-control.md) | Why MQTT rather than REST from Home Assistant |
+
+Each lamp also serves its own REST reference at `http://<lamp>/help`, and the
+same thing as JSON at `/api` — those describe the firmware actually running.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).

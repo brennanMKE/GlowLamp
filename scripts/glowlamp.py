@@ -522,7 +522,12 @@ def main(argv=None) -> int:
 
                 name = (status or {}).get("name") or f.label
                 version = (status or {}).get("version") or f.version
-                line = f"{name:<20} {f.url:<30} {'v' + version if version else '?':<8}"
+                # The lamp's own idea of its .local name, which is the one to
+                # write down: the browse record can be a stale one from before a
+                # rename, and an address can move with a DHCP lease.
+                hostname = (status or {}).get("mdns") or f.hostname
+                line = (f"{name:<20} {'http://' + hostname + '/':<34}"
+                        f"{f.address:<16} {'v' + version if version else '?':<8}")
                 if status is None:
                     line += " not answering"
                 else:

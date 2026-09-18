@@ -20,6 +20,11 @@ void loopMqtt();
 bool mqttEnabled();
 bool mqttConnected();
 
+// Why the last connect attempt failed: PubSubClient's state code, and the same
+// thing in words. Empty and 0 when the last attempt succeeded.
+int mqttLastRc();
+const char *mqttLastError();
+
 // Drop the connection so the next loop reconnects with current settings. Called
 // when the broker settings are saved.
 void mqttSettingsChanged();

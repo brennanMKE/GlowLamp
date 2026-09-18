@@ -119,6 +119,7 @@ void LampSettings::registerRoutes() {
     // to the application -- its own 404 page even advertises "/" as the device
     // home page. Without this, the bare hostname 404s.
     server.on("/", HTTP_GET, std::bind(&LampSettings::handleHome, this));
+    server.on("/effects", HTTP_GET, std::bind(&LampSettings::handleEffectsPage, this));
     server.on("/settings", HTTP_GET, std::bind(&LampSettings::handleSettingsGet, this));
     server.on("/settings", HTTP_POST, std::bind(&LampSettings::handleSettingsSave, this));
     server.on("/help", HTTP_GET, std::bind(&LampSettings::handleHelp, this));
@@ -288,6 +289,9 @@ String LampSettings::statusJson(bool pretty) const {
     mqttObj["connected"] = mqttConnected();
     mqttObj["host"] = broker;
     mqttObj["port"] = brokerPort;
+    mqttObj["user"] = brokerUser;  // never the password
+    mqttObj["error"] = mqttLastError();
+    mqttObj["rc"] = mqttLastRc();
 
     JsonObject ota = doc["ota"].to<JsonObject>();
     ota["state"] = otaState();
@@ -710,6 +714,18 @@ static const char *EXTRA_CSS =
     "input[type=range]{width:100%;}"
     "#swatch{display:inline-block;width:14px;height:14px;border-radius:50%;"
     "margin-right:8px;vertical-align:-2px;border:1px solid rgba(0,0,0,.15);}"
+    "#fxbuttons{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:8px 0 4px;}"
+    "button.fx{display:block;width:100%;text-align:left;padding:12px 14px;border:1px solid #ddd;"
+    "border-radius:10px;background:#fafafa;cursor:pointer;font:inherit;}"
+    "button.fx b{display:block;font-size:15px;color:#333;text-transform:capitalize;}"
+    "button.fx span{display:block;font-size:12px;color:#888;margin-top:2px;line-height:1.35;}"
+    "button.fx.on{border-color:#007bff;background:#eaf3ff;box-shadow:0 0 0 2px rgba(0,123,255,.12);}"
+    "button.fx.on b{color:#0056b3;}"
+    "#presets{margin:8px 0 14px;}"
+    "button.preset{padding:7px 13px;margin:0 6px 6px 0;border:1px solid #ddd;border-radius:999px;"
+    "background:#fff;cursor:pointer;font:inherit;font-size:14px;color:#555;}"
+    "button.preset:hover{border-color:#aaa;color:#222;}"
+    "@media(max-width:420px){#fxbuttons{grid-template-columns:1fr;}}"
     ".swatchbox{display:inline-block;text-align:center;margin:0 10px 8px 0;}"
     ".swatchbox input[type=color]{width:52px;height:38px;padding:0;border:1px solid #ddd;"
     "border-radius:8px;background:none;cursor:pointer;display:block;}"
@@ -844,7 +860,10 @@ void LampSettings::handleHome() {
     b += "</table>";
 
     b += "<div class='button-group'>";
+    b += "<a href='/effects' class='button primary'>Effects &amp; colors</a>";
     b += "<a href='/settings' class='button'>Settings</a>";
+    b += "</div>";
+    b += "<div class='button-group'>";
     b += "<a href='/help' class='button'>API</a>";
     b += "<a href='/wifi' class='button'>WiFi Setup</a>";
     b += "</div>";
@@ -873,6 +892,156 @@ void LampSettings::handleHome() {
     server.send(200, "text/html", page("Glow Lamp", b));
 }
 
+
+// The page this lamp is meant to be used from. Everything here changes what the
+// ring is doing right now; everything on /settings changes what the lamp IS.
+// The effect picker started out on /settings and was the most-used control on
+// the least-visited page.
+void LampSettings::handleEffectsPage() {
+    String b;
+
+    b += controlsHtml();
+
+    b += "<hr>";
+    b += "<h2>Effect</h2>";
+    // Buttons rather than a dropdown: four options that each need a sentence of
+    // explanation are a poor fit for a control that shows one of them at a time.
+    const char *what[EFFECT_COUNT] = {
+        "holds a color, eases to the next",
+        "walks the palette, never resting",
+        "mixes similar colors, like a flame",
+        "steady, with the stutter of a failing tube",
+    };
+    b += "<div id='fxbuttons'>";
+    for (uint8_t i = 0; i < EFFECT_COUNT; i++) {
+        b += "<button class='fx' data-fx='" + String(EFFECT_NAMES[i]) + "'>";
+        b += "<b>" + String(EFFECT_NAMES[i]) + "</b><span>" + what[i] + "</span>";
+        b += "</button>";
+    }
+    b += "</div>";
+
+    b += "<h2>Colors</h2>";
+    b += "<div id='presets'>";
+    // One tap for a palette that is known to work, which is most of what makes
+    // this page easy. Flame is first because it is the one flicker is built for.
+    struct Preset {
+        const char *name;
+        const char *colors;
+    };
+    const Preset presets[] = {
+        {"Flame", "#ff2000,#ff6000,#ffa000"},
+        {"Ocean", "#0040ff,#00c0ff,#00ffc0"},
+        {"Sunset", "#ff0040,#ff6000,#ffc000"},
+        {"Forest", "#00ff40,#80ff00,#00c080"},
+        {"Vivid", "#ff0000,#ffaa00,#00ff00,#0055ff,#aa00ff"},
+    };
+    for (const Preset &p : presets) {
+        b += "<button class='preset' data-colors='" + String(p.colors) + "'>" + p.name +
+             "</button>";
+    }
+    b += "</div>";
+
+    b += "<div id='swatches'>";
+    for (uint8_t i = 0; i < MAX_COLORS; i++) {
+        String n = String(i);
+        b += "<span class='swatchbox'>";
+        b += "<input type='color' id='c" + n + "'>";
+        b += "<label><input type='checkbox' id='u" + n + "' checked> use</label>";
+        b += "</span>";
+    }
+    b += "</div>";
+
+    b += "<div class='form-group' style='margin-top:18px'>";
+    b += "<label for='secs'>Revert after</label>";
+    b += "<select id='secs'>";
+    b += "<option value='300' selected>5 minutes</option>";
+    b += "<option value='900'>15 minutes</option>";
+    b += "<option value='1800'>30 minutes</option>";
+    b += "<option value='3600'>1 hour</option>";
+    b += "<option value='14400'>4 hours</option>";
+    b += "<option value='28800'>8 hours</option>";
+    b += "<option value='0'>until the lamp reboots</option>";
+    b += "</select>";
+    b += "<small>An effect is temporary on purpose. When it expires the lamp goes back "
+         "to blending its five default colors, and nothing here survives a reboot.</small>";
+    b += "</div>";
+
+    b += "<div id='fxstate'></div>";
+    b += "<div class='button-group'>";
+    b += "<button id='applyfx' class='button primary'>Apply</button>";
+    b += "<button id='resetfx' class='button'>Back to default</button>";
+    b += "</div>";
+
+    b += "<div class='button-group'>";
+    b += "<a href='/' class='button'>Home</a>";
+    b += "<a href='/settings' class='button'>Settings</a>";
+    b += "</div>";
+
+    b += "<script>";
+    b += controlsJs();
+    b += "var fxTouched=false,chosen='blend';"
+         "function mark(){"
+         "var bs=document.querySelectorAll('.fx');"
+         "for(var i=0;i<bs.length;i++){"
+         "bs[i].className='fx'+(bs[i].dataset.fx==chosen?' on':'');}"
+         "}"
+         "var fxb=document.querySelectorAll('.fx');"
+         "for(var i=0;i<fxb.length;i++){fxb[i].onclick=function(){"
+         "chosen=this.dataset.fx;fxTouched=true;mark();apply();};}"
+         "var pb=document.querySelectorAll('.preset');"
+         "for(var i=0;i<pb.length;i++){pb[i].onclick=function(){"
+         "var cs=this.dataset.colors.split(',');"
+         "for(var j=0;j<5;j++){"
+         "document.getElementById('u'+j).checked=j<cs.length;"
+         "if(j<cs.length)document.getElementById('c'+j).value=cs[j];}"
+         "fxTouched=true;apply();};}"
+         "for(var i=0;i<5;i++){"
+         "document.getElementById('c'+i).onchange=function(){fxTouched=true;};"
+         "document.getElementById('u'+i).onchange=function(){fxTouched=true;};}"
+         "document.getElementById('secs').onchange=function(){fxTouched=true;};"
+         "function colors(){"
+         "var out=[];"
+         "for(var i=0;i<5;i++){"
+         "if(document.getElementById('u'+i).checked)out.push(document.getElementById('c'+i).value);}"
+         "return out;}"
+         "function apply(){"
+         "var cs=colors();"
+         "if(!cs.length){alert('Pick at least one color.');return;}"
+         "post('/api/effect',{effect:chosen,colors:cs,"
+         "seconds:parseInt(document.getElementById('secs').value,10)})"
+         ".then(function(s){render(s);fxRender(s.effect);});}"
+         "document.getElementById('applyfx').onclick=apply;"
+         "document.getElementById('resetfx').onclick=function(){"
+         "post('/api/effect/reset',{}).then(function(s){"
+         "fxTouched=false;render(s);fxRender(s.effect);});};"
+         "function fxRender(f){"
+         "var box=document.getElementById('fxstate');"
+         "if(f.default){box.innerHTML=\"<div class='status success'>Showing the default: \"+"
+         "f.name+\"</div>\";}"
+         "else if(f.expires_in<0){box.innerHTML=\"<div class='status warning'>\"+f.name+"
+         "\", until the lamp reboots</div>\";}"
+         "else{var m=Math.floor(f.expires_in/60),sec=f.expires_in%60;"
+         "box.innerHTML=\"<div class='status warning'>\"+f.name+\", reverting in \"+"
+         "(m?m+'m ':'')+sec+\"s</div>\";}"
+         // Once someone starts choosing, the poller stops overwriting them --
+         // otherwise picking a color would be undone a second later by whatever
+         // the lamp happens to be showing.
+         "if(fxTouched){mark();return;}"
+         "var sel=f.selected;"
+         "chosen=sel.name;mark();"
+         "for(var i=0;i<5;i++){"
+         "var has=i<sel.colors.length;"
+         "document.getElementById('u'+i).checked=has;"
+         "if(has)document.getElementById('c'+i).value=sel.colors[i];}"
+         "}"
+         "function u(){fetch('/api/status?pretty=0',{cache:'no-store'}).then(r=>r.json())"
+         ".then(s=>{render(s);fxRender(s.effect);}).catch(()=>{});}"
+         "setInterval(u,1000);u();"
+         "</script>";
+
+    configServer.getServer().send(200, "text/html", page("Effects", b));
+}
+
 void LampSettings::handleSettingsGet() {
     String b;
 
@@ -890,59 +1059,6 @@ void LampSettings::handleSettingsGet() {
 
     b += "<hr>";
     b += controlsHtml();
-
-    b += "<hr>";
-    b += "<h2>Effect</h2>";
-    b += "<div class='form-group'>";
-    b += "<label for='effect'>Effect</label>";
-    b += "<select id='effect'>";
-    const char *what[EFFECT_COUNT] = {
-        "Blend \u2014 holds a color, eases to the next",
-        "Loop \u2014 walks the palette, never resting",
-        "Flicker \u2014 mixes similar colors, like a flame",
-        "Neon \u2014 steady, with the stutter of a failing tube",
-    };
-    for (uint8_t i = 0; i < EFFECT_COUNT; i++) {
-        b += "<option value='" + String(EFFECT_NAMES[i]) + "'>" + what[i] + "</option>";
-    }
-    b += "</select>";
-    b += "</div>";
-
-    // Five pickers, each with a checkbox. A count field would make picking two
-    // colors mean "the first two", so the colors you want have to be the first
-    // ones in the row -- the checkbox lets any two be the two.
-    b += "<div class='form-group'>";
-    b += "<label>Colors <small style='display:inline;color:#999'>(up to 5)</small></label>";
-    b += "<div id='swatches'>";
-    for (uint8_t i = 0; i < MAX_COLORS; i++) {
-        String n = String(i);
-        b += "<span class='swatchbox'>";
-        b += "<input type='color' id='c" + n + "'>";
-        b += "<label><input type='checkbox' id='u" + n + "' checked> use</label>";
-        b += "</span>";
-    }
-    b += "</div></div>";
-
-    b += "<div class='form-group'>";
-    b += "<label for='secs'>Revert after</label>";
-    b += "<select id='secs'>";
-    b += "<option value='300' selected>5 minutes</option>";
-    b += "<option value='900'>15 minutes</option>";
-    b += "<option value='1800'>30 minutes</option>";
-    b += "<option value='3600'>1 hour</option>";
-    b += "<option value='14400'>4 hours</option>";
-    b += "<option value='28800'>8 hours</option>";
-    b += "<option value='0'>until the lamp reboots</option>";
-    b += "</select>";
-    b += "<small>An effect is temporary on purpose: when it expires the lamp goes "
-         "back to blending the five default colors. Nothing here survives a reboot.</small>";
-    b += "</div>";
-
-    b += "<div id='fxstate'></div>";
-    b += "<div class='button-group'>";
-    b += "<button id='applyfx' class='button primary'>Apply effect</button>";
-    b += "<button id='resetfx' class='button'>Back to default</button>";
-    b += "</div>";
 
     b += "<hr>";
     b += "<form method='POST' action='/settings'>";
@@ -1012,56 +1128,14 @@ void LampSettings::handleSettingsGet() {
     b += "<form method='POST' action='/reboot' onsubmit='return confirm(\"Reboot the lamp?\")'>";
     b += "<div class='button-group'>";
     b += "<a href='/' class='button'>Home</a>";
+    b += "<a href='/effects' class='button'>Effects</a>";
     b += "<a href='/help' class='button'>API</a>";
     b += "<button type='submit' class='button danger'>Reboot</button>";
     b += "</div></form>";
 
     b += "<script>";
     b += controlsJs();
-    b += "var fxTouched=false;"
-         // Once someone starts choosing, the poller stops overwriting their
-         // choices -- otherwise picking a color would be undone a second later
-         // by whatever the lamp is currently showing.
-         "document.getElementById('effect').onchange=function(){fxTouched=true;};"
-         "document.getElementById('secs').onchange=function(){fxTouched=true;};"
-         "for(var i=0;i<5;i++){"
-         "document.getElementById('c'+i).onchange=function(){fxTouched=true;};"
-         "document.getElementById('u'+i).onchange=function(){fxTouched=true;};"
-         "}"
-         "function fxRender(f){"
-         "var box=document.getElementById('fxstate');"
-         "if(f.default){box.innerHTML=\"<div class='status success'>Showing the default: \"+"
-         "f.name+\"</div>\";}"
-         "else if(f.expires_in<0){box.innerHTML=\"<div class='status warning'>\"+f.name+"
-         "\", until the lamp reboots</div>\";}"
-         "else{var m=Math.floor(f.expires_in/60),sec=f.expires_in%60;"
-         "box.innerHTML=\"<div class='status warning'>\"+f.name+\", reverting in \"+"
-         "(m?m+'m ':'')+sec+\"s</div>\";}"
-         "if(fxTouched)return;"
-         // From f.selected, not f.colors: the pickers show what you chose,
-         // which is not always what the lamp is showing.
-         "var sel=f.selected;"
-         "document.getElementById('effect').value=sel.name;"
-         "for(var i=0;i<5;i++){"
-         "var has=i<sel.colors.length;"
-         "document.getElementById('u'+i).checked=has;"
-         "if(has)document.getElementById('c'+i).value=sel.colors[i];"
-         "}"
-         "}"
-         "document.getElementById('applyfx').onclick=function(){"
-         "var colors=[];"
-         "for(var i=0;i<5;i++){"
-         "if(document.getElementById('u'+i).checked)colors.push(document.getElementById('c'+i).value);"
-         "}"
-         "if(!colors.length){alert('Pick at least one color.');return;}"
-         "post('/api/effect',{effect:document.getElementById('effect').value,colors:colors,"
-         "seconds:parseInt(document.getElementById('secs').value,10)})"
-         ".then(function(s){fxTouched=false;render(s);fxRender(s.effect);});"
-         "};"
-         "document.getElementById('resetfx').onclick=function(){"
-         "post('/api/effect/reset',{}).then(function(s){fxTouched=false;render(s);fxRender(s.effect);});"
-         "};"
-         "var installing=false;"
+    b += "var installing=false;"
          "function esc(t){var d=document.createElement('div');d.textContent=t;return d.innerHTML;}"
          "function otaBox(o){"
          "var box=document.getElementById('otabox'),btn=document.getElementById('checkbtn');"
@@ -1098,10 +1172,11 @@ void LampSettings::handleSettingsGet() {
          "over its REST API.</div>\";return;}"
          "box.innerHTML=m.connected"
          "?\"<div class='status success'>Connected to \"+m.host+\"</div>\""
-         ":\"<div class='status warning'>Not connected to \"+m.host+\"</div>\";"
+         ":\"<div class='status warning'>Not connected to \"+m.host+"
+         "(m.error?\": \"+m.error:'')+\"</div>\";"
          "}"
          "function u(){fetch('/api/status?pretty=0',{cache:'no-store'}).then(r=>r.json()).then(s=>{"
-         "render(s);otaBox(s.ota);fxRender(s.effect);mqttBox(s.mqtt);"
+         "render(s);otaBox(s.ota);mqttBox(s.mqtt);"
          "}).catch(()=>{});}"
          "setInterval(u,1000);u();"
          "</script>";

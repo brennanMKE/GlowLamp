@@ -69,6 +69,7 @@ private:
 
     // ===== Pages =====
     void handleHome();
+    void handleEffectsPage();
     void handleSettingsGet();
     void handleSettingsSave();
     void handleHelp();

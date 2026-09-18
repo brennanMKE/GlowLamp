@@ -23,6 +23,12 @@ static uint32_t retryAt = 0;
 // 60 times a second. The lamp's live color moves constantly under blend; the
 // color reported to Home Assistant is the palette's first entry instead, which
 // is stable and is what someone picked.
+// Why the last connect attempt failed. Kept because the alternative is a serial
+// cable: a broker that refuses a lamp does so silently from the network's point
+// of view, and "not connected" on the settings page says nothing about whether
+// the address is wrong, the credentials are, or the broker simply is not there.
+static int lastRc = 0;
+
 static bool lastPower = false;
 static uint8_t lastBrightness = 0;
 static String lastEffect;
@@ -47,6 +53,25 @@ static String availabilityTopic() { return baseTopic() + "/availability"; }
 
 bool mqttEnabled() { return settings.mqttHost().length() > 0; }
 bool mqttConnected() { return mqtt.connected(); }
+
+int mqttLastRc() { return lastRc; }
+
+// PubSubClient's state codes, which are otherwise a number to go and look up.
+const char *mqttLastError() {
+    switch (lastRc) {
+        case 0: return "";
+        case -4: return "timed out waiting for the broker";
+        case -3: return "connection lost";
+        case -2: return "could not reach the broker (check the address and port)";
+        case -1: return "disconnected";
+        case 1: return "broker refused the protocol version";
+        case 2: return "broker rejected the client id";
+        case 3: return "broker unavailable";
+        case 4: return "broker rejected the username or password";
+        case 5: return "broker refused authorization";
+        default: return "unknown error";
+    }
+}
 
 void mqttSettingsChanged() {
     if (mqtt.connected()) {
@@ -270,10 +295,16 @@ void loopMqtt() {
     }
 
     if (!ok) {
-        ESP_LOGW(TAG, "connect failed, rc=%d", mqtt.state());
+        lastRc = mqtt.state();
+        // ESP_LOGE, not LOGW: the release build logs nothing below ERROR, and a
+        // lamp that cannot reach its broker is exactly the thing someone is
+        // trying to find out about when they plug a serial cable in.
+        ESP_LOGE(TAG, "connect to %s:%u failed, rc=%d (%s)", settings.mqttHost().c_str(),
+                 settings.mqttPort(), lastRc, mqttLastError());
         return;
     }
 
+    lastRc = 0;
     ESP_LOGI(TAG, "connected");
     mqtt.publish(avail.c_str(), "online", true);
     mqtt.subscribe(commandTopic().c_str());

@@ -80,7 +80,8 @@ UI lives at:
 | Path | What |
 |---|---|
 | `/` | Status, and the controls: on/off, brightness, identify |
-| `/settings` | Firmware check and update, the same controls, names, reboot |
+| `/effects` | The everyday page: effect, colors, presets |
+| `/settings` | Firmware check and update, names, MQTT broker, reboot |
 | `/help` | The REST API, documented by the lamp itself |
 | `/api` | The same reference as JSON |
 | `/wifi` | EasyWiFi's own setup pages |

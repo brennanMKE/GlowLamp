@@ -82,7 +82,9 @@ safe to publish and any lamp can be re-provisioned in the field.
 |-
 | <code>/</code> || Status, and the controls: on/off, brightness, identify
 |-
-| <code>/settings</code> || Firmware updates, effects and colors, names, MQTT broker, reboot
+| <code>/effects</code> || '''The everyday page''': effect, colors, presets, brightness, on/off
+|-
+| <code>/settings</code> || Firmware updates, names, MQTT broker, reboot
 |-
 | <code>/help</code> || The REST API, documented by the lamp itself
 |-
@@ -108,6 +110,9 @@ restores whatever was showing, so identifying a lamp that is off leaves it off.
 |-
 | <code>neon</code> || One color, steady, with the stutter of a failing neon tube.
 |}
+
+Set from <code>http://<lamp>/effects</code>, which carries one-tap presets (Flame,
+Ocean, Sunset, Forest, Vivid) alongside the individual color pickers.
 
 Up to '''5 colors'''. Colors are carried as hue and saturation rather than RGB, and
 transitions travel the short way around the color wheel: an RGB blend between

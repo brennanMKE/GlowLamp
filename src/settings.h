@@ -73,6 +73,7 @@ private:
     void handleApiName();
     void handleApiOtaCheck();
     void handleApiOtaInstall();
+    void handleApiOtaUpdate();
     void handleApiReboot();
 
     // Serialize the full lamp state. `pretty` is for a human reading /api/status

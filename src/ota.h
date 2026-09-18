@@ -17,6 +17,12 @@ void loopOta();
 void requestOtaCheck();
 void requestOtaInstall();
 
+// Check, and install only if the latest release differs from what is running.
+// The same thing the nightly timer does, exposed so Home Assistant can drive
+// the schedule instead -- a check that installs nothing when there is nothing
+// new is safe to fire at every lamp every night.
+void requestOtaUpdate();
+
 // ===== What the status page reads =====
 
 // "idle", "checking", "installing" or "error".

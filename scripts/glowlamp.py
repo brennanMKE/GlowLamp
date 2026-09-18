@@ -153,6 +153,14 @@ class Lamp:
     def install_update(self) -> dict:
         return self._request("POST", "/api/ota/install")
 
+    def update(self) -> dict:
+        """Check, and install only if the latest release differs.
+
+        One request, and a no-op on a lamp that is already current -- which is
+        what makes it safe to run against every lamp on a schedule.
+        """
+        return self._request("POST", "/api/ota/update")
+
     def reboot(self) -> dict:
         return self._request("POST", "/api/reboot")
 
@@ -358,33 +366,45 @@ def _describe(status: dict) -> str:
 
 
 def main(argv=None) -> int:
+    # Which lamps a command applies to. Attached to each subcommand rather than
+    # to the top-level parser, so these read the way anyone would type them --
+    # "off --all", not "--all off". Argparse only accepts an option before the
+    # subcommand when it is defined on the parent, and only after when it is
+    # defined on the child; the natural order is the one that gets to work.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--host", help="address or .local name of one lamp; skips discovery")
+    common.add_argument("--name", help="match a discovered lamp by name (substring)")
+    common.add_argument("--all", action="store_true", help="every lamp found")
+    common.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT,
+                        help=f"seconds to browse for lamps (default {DEFAULT_TIMEOUT:g})")
+    common.add_argument("--json", action="store_true", help="print raw JSON")
+
     parser = argparse.ArgumentParser(
         description="Find and control Glow Lamps.",
         epilog="With no --host/--name/--all, a command runs against the only lamp found.",
     )
-    parser.add_argument("--host", help="address or .local name of one lamp; skips discovery")
-    parser.add_argument("--name", help="match a discovered lamp by name (substring)")
-    parser.add_argument("--all", action="store_true", help="every lamp found")
-    parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT,
-                        help=f"seconds to browse for lamps (default {DEFAULT_TIMEOUT:g})")
-    parser.add_argument("--json", action="store_true", help="print raw JSON")
-
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("discover", help="list the lamps on this network")
-    sub.add_parser("status", help="what each lamp is doing")
-    sub.add_parser("on", help="switch on")
-    sub.add_parser("off", help="switch off")
-    sub.add_parser("toggle", help="switch to the opposite state")
-    p_bright = sub.add_parser("brightness", help="set brightness 0-255")
+
+    def add(name, help_text):
+        return sub.add_parser(name, help=help_text, parents=[common])
+
+    add("discover", "list the lamps on this network")
+    add("status", "what each lamp is doing")
+    add("on", "switch on")
+    add("off", "switch off")
+    add("toggle", "switch to the opposite state")
+    p_bright = add("brightness", "set brightness 0-255")
     p_bright.add_argument("value", type=int)
-    p_id = sub.add_parser("identify", help="blink white to find a lamp")
+    p_id = add("identify", "blink white to find a lamp")
     p_id.add_argument("--seconds", type=int, default=4)
-    p_name = sub.add_parser("rename", help="set the lamp name and/or hostname")
-    p_name.add_argument("--name", dest="new_name")
-    p_name.add_argument("--hostname", dest="new_hostname")
-    p_update = sub.add_parser("update", help="check for a new release, and install it")
+    # --set-name, not --name: --name already means "which lamp" on every
+    # subcommand, and one flag cannot mean both which and what.
+    p_name = add("rename", "set the lamp name and/or hostname")
+    p_name.add_argument("--set-name", dest="new_name", help="the free-text lamp name")
+    p_name.add_argument("--set-hostname", dest="new_hostname", help="the mDNS label")
+    p_update = add("update", "check for a new release, and install it")
     p_update.add_argument("--check", action="store_true", help="check only, install nothing")
-    sub.add_parser("reboot", help="reboot")
+    add("reboot", "reboot")
 
     args = parser.parse_args(argv)
 
@@ -424,19 +444,16 @@ def main(argv=None) -> int:
             elif args.command == "reboot":
                 result = lamp.reboot()
             elif args.command == "update":
-                result = lamp.check_for_update()
-                # The check is a round trip to GitHub on the device, so the
-                # answer is not in the response that acknowledged the request.
-                time.sleep(4)
-                result = lamp.status()
-                if not args.check:
-                    if result.get("ota", {}).get("available"):
-                        latest = result["ota"]["latest"]
-                        print(f"{result.get('name', '?')}: installing v{latest}...")
-                        lamp.install_update()
-                    else:
-                        print(f"{result.get('name', '?')}: up to date "
-                              f"(v{result.get('version', '?')})")
+                if args.check:
+                    lamp.check_for_update()
+                    # The check is a round trip to GitHub on the device, so the
+                    # answer is not in the response that acknowledged it.
+                    time.sleep(4)
+                    result = lamp.status()
+                else:
+                    # The lamp decides: it installs only if the release differs,
+                    # so there is nothing to poll and nothing to decide here.
+                    result = lamp.update()
             else:  # pragma: no cover - argparse rejects anything else
                 raise LampError(f"unknown command {args.command}")
 

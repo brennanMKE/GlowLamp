@@ -108,6 +108,7 @@ void LampSettings::registerRoutes() {
     server.on("/api/name", HTTP_POST, std::bind(&LampSettings::handleApiName, this));
     server.on("/api/ota/check", HTTP_POST, std::bind(&LampSettings::handleApiOtaCheck, this));
     server.on("/api/ota/install", HTTP_POST, std::bind(&LampSettings::handleApiOtaInstall, this));
+    server.on("/api/ota/update", HTTP_POST, std::bind(&LampSettings::handleApiOtaUpdate, this));
     server.on("/api/reboot", HTTP_POST, std::bind(&LampSettings::handleApiReboot, this));
 
     // Kept from 0.0.2, which shipped these paths and a find_devices.sh that
@@ -273,6 +274,8 @@ void LampSettings::handleApiIndex() {
         "Rename. A changed hostname needs a reboot to take effect.");
     add("POST", "/api/ota/check", "", "Ask GitHub for the latest release. Installs nothing.");
     add("POST", "/api/ota/install", "", "Install the latest release, then reboot.");
+    add("POST", "/api/ota/update", "",
+        "Check, and install only if the release differs. Safe to call on a schedule.");
     add("POST", "/api/reboot", "", "Reboot the lamp.");
 
     doc["notes"]["responses"] =
@@ -378,6 +381,18 @@ void LampSettings::handleApiOtaInstall() {
     requestOtaInstall();
     // Answered before the download starts, because once it does this device
     // stops serving anything until it reboots.
+    sendStatus();
+}
+
+// One call for a scheduler. Check-then-install-if-different is what the lamp's
+// own nightly timer does; this is the same thing on someone else's schedule, so
+// Home Assistant can drive the rollout without a second request to decide.
+//
+// A lamp with nothing new to take does nothing at all, which is what makes this
+// safe to fire at every lamp every night.
+void LampSettings::handleApiOtaUpdate() {
+    ESP_LOGI(TAG, "check-and-update requested over HTTP (running %s)", FIRMWARE_VERSION);
+    requestOtaUpdate();
     sendStatus();
 }
 
@@ -800,6 +815,10 @@ void LampSettings::handleHelp() {
     b += ep("POST", "/api/ota/install", "",
             "Install the latest release and reboot. The lamp answers first, then stops "
             "responding for 10&ndash;30 s while it downloads.");
+    b += ep("POST", "/api/ota/update", "",
+            "Check, and install only if the latest release differs from what is running. "
+            "One call, nothing to decide on the caller's side, and a no-op when there is "
+            "nothing new &mdash; this is the one to put on a nightly schedule.");
     b += ep("POST", "/api/reboot", "", "Reboot the lamp.");
 
     b += "<h2>Examples</h2>";
@@ -811,6 +830,8 @@ void LampSettings::handleHelp() {
     b += "curl -X POST " + base + "/api/brightness -d '{\"value\":128}'\n\n";
     b += "# which one is this?\n";
     b += "curl -X POST " + base + "/api/identify -d '{\"seconds\":4}'\n\n";
+    b += "# nightly: take a new release if there is one, do nothing if not\n";
+    b += "curl -X POST " + base + "/api/ota/update\n\n";
     b += "# a query parameter works too, if quoting JSON is awkward\n";
     b += "curl -X POST '" + base + "/api/power?on=toggle'</code></pre>";
 

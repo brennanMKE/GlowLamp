@@ -181,7 +181,8 @@ A lamp can find out about a new release three ways:
 |---|---|
 | 15 s after joining WiFi | Checks, and installs if the tag differs |
 | Daily at 15:00 local | Same |
-| The status page, or `POST /ota/check` | Checks only, and reports |
+| `POST /api/ota/update` | Same, on someone else's schedule |
+| The settings page, or `POST /api/ota/check` | Checks only, and reports |
 
 The first two are unattended, so they install on their own — nobody is watching,
 and there is no point holding an update back for an empty room. A check you
@@ -203,10 +204,17 @@ Both endpoints answer JSON and take POST, never GET — a link a browser can
 prefetch should not be able to reflash a lamp.
 
 ```sh
-curl -X POST http://glow-lamp-051860.local/ota/check     # ask GitHub
-curl -s http://glow-lamp-051860.local/status.json        # read the answer
-curl -X POST http://glow-lamp-051860.local/ota/install   # take it
+curl -X POST http://glow-lamp-051860.local/api/ota/check    # ask GitHub
+curl -s http://glow-lamp-051860.local/api/status            # read the answer
+curl -X POST http://glow-lamp-051860.local/api/ota/install  # take it
+
+curl -X POST http://glow-lamp-051860.local/api/ota/update   # both, if there is one
 ```
+
+The last one is the scheduler's endpoint: it checks, installs only if the
+release differs, and does nothing at all on a lamp that is current. Home
+Assistant can fire it at every lamp nightly — see
+[docs/home-assistant.md](docs/home-assistant.md).
 
 `status.json` carries the firmware block the scan and the status page both read:
 

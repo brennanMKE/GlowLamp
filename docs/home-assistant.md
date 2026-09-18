@@ -98,6 +98,47 @@ shell_command:
   lamp_living_off: "/config/scripts/glowlamp.py off --host glow-lamp-051860.local"
 ```
 
+## Nightly firmware updates
+
+`POST /api/ota/update` makes the lamp check GitHub and install a new release
+only if the tag differs from what it is running. A lamp with nothing to take
+does nothing, so this is safe to fire at every lamp every night.
+
+```yaml
+rest_command:
+  lamp_update:
+    url: "http://{{ host }}/api/ota/update"
+    method: POST
+
+automation:
+  - alias: Update the lamps overnight
+    triggers:
+      - trigger: time
+        at: "03:30:00"
+    actions:
+      - action: rest_command.lamp_update
+        data:
+          host: glow-lamp-051860.local
+      - action: rest_command.lamp_update
+        data:
+          host: glow-lamp-fe00bc.local
+```
+
+Or let the script find them, so a new lamp needs no config change:
+
+```yaml
+shell_command:
+  lamps_update: "/config/scripts/glowlamp.py update --all"
+```
+
+The lamp keeps its own daily check at 15:00 local regardless. Driving it from
+Home Assistant instead is worth it for the timing: you pick the hour, and it is
+the same hour for every lamp.
+
+A lamp is unreachable for 10-30 s while it downloads, and reboots afterwards.
+Overnight is a good time for that; it is also the reason the firmware's own
+default is mid-afternoon, when someone is around to notice a bad one.
+
 ## As a module
 
 ```python

@@ -81,6 +81,7 @@ static Preferences prefs;
 // Set from the web handlers, acted on in loopOta(). See ota.h.
 static bool checkRequested = false;
 static bool installRequested = false;
+static bool updateRequested = false;
 
 // Everything the status page shows. `state` is a pointer to a literal rather
 // than a String so reading it from the web handler cannot race a reallocation.
@@ -92,6 +93,7 @@ static bool haveChecked = false;
 
 void requestOtaCheck() { checkRequested = true; }
 void requestOtaInstall() { installRequested = true; }
+void requestOtaUpdate() { updateRequested = true; }
 
 const char *otaState() { return state; }
 String otaLatestTag() { return latestTag; }
@@ -240,7 +242,14 @@ void loopOta() {
     if (installRequested) {
         installRequested = false;
         checkRequested = false;
+        updateRequested = false;
         performOtaInstall();
+        return;
+    }
+    if (updateRequested) {
+        updateRequested = false;
+        checkRequested = false;
+        checkAndInstall();
         return;
     }
     if (checkRequested) {

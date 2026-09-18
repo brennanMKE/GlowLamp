@@ -139,7 +139,7 @@ curl -X POST http://glow-lamp-051860.local/api/effect/reset
 | `blend` | The whole ring holds one color and eases to the next. The default. |
 | `loop` | Walks the palette steadily, never resting on a color. |
 | `flicker` | Similar colors mixing and guttering, like a flame. The one effect that lights the ring several colors at once. |
-| `neon` | One color, bright and steady, with an occasional brief flicker. Colors cross-fade. |
+| `neon` | One color at full brightness, held steady, switching cleanly to the next. |
 
 Up to 5 colors. An effect reverts to the default after 5 minutes unless you say
 otherwise, is capped at 8 hours, and does not survive a reboot — see

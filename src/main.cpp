@@ -54,11 +54,11 @@ static const uint32_t BLEND_MS = 6000;
 // "moving".
 static const uint32_t LOOP_LEG_MS = 2500;
 
-// Neon holds a color, then cross-fades into the next over the tail of the leg.
-// The fade is quick relative to the hold: a tube changing color is a thing that
+// Neon holds a color dead still, then switches over the tail of the leg. The
+// fade is quick relative to the hold: a tube changing color is a thing that
 // happens, not a thing you watch happen.
 static const uint32_t NEON_LEG_MS = 7000;
-static const uint32_t NEON_FADE_MS = 900;
+static const uint32_t NEON_FADE_MS = 700;
 
 // ~60 fps. Faster buys nothing visible and each show() disables interrupts for
 // roughly 30 us per LED.
@@ -145,8 +145,6 @@ static void applyPalette(const PaletteColor *colors, uint8_t count) {
     for (uint8_t i = 0; i < NUM_LEDS; i++) fx.timeouts[i] = now;
     fx.hueTimeout = now + 3000;
     fx.hueIndex = 0;
-    fx.value = 255;
-    fx.blinks = 0;
 }
 
 void resetLampEffect() {
@@ -265,7 +263,7 @@ static void loopLeds() {
             break;
         case EFFECT_NEON:
             fx.phase %= NEON_LEG_MS * fx.colorCount;
-            renderNeon(fx, now, NEON_LEG_MS, NEON_FADE_MS);
+            renderNeon(fx, NEON_LEG_MS, NEON_FADE_MS);
             break;
         case EFFECT_BLEND:
         default:

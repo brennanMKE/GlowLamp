@@ -77,7 +77,7 @@ enum EffectMode {
     EFFECT_BLEND = 0,    // holds on a color, eases to the next
     EFFECT_LOOP = 1,     // walks the palette steadily, never resting
     EFFECT_FLICKER = 2,  // several similar colors mixing, guttering like a flame
-    EFFECT_NEON = 3,     // one color, bright and steady, with an occasional flicker
+    EFFECT_NEON = 3,     // one color, full brightness, switching cleanly to the next
     EFFECT_COUNT = 4
 };
 
@@ -99,17 +99,12 @@ struct EffectState {
     // because the wrap point is not a multiple of the cycle.
     uint32_t phase = 0;
 
-    // When the ring (or, for flicker, each LED) next changes brightness, what
-    // that brightness is, and which palette entry is showing. Flicker runs a
-    // timer per LED because its LEDs are deliberately out of step; neon uses
-    // timeouts[0] alone, for the whole ring.
+    // Flicker only: when each LED next picks a new brightness, and which palette
+    // entry the ring is drifting through. A timer per LED is what puts them
+    // deliberately out of step; no other effect varies brightness at all.
     uint32_t timeouts[MAX_LEDS];
     uint32_t hueTimeout = 0;
     uint8_t hueIndex = 0;
-    uint8_t value = 255;
-
-    // NEON only: how many hard on/off blips are left in the current burst.
-    uint8_t blinks = 0;
 };
 
 // ===== Shared helpers =====
@@ -198,53 +193,29 @@ inline void renderFlicker(EffectState &s, uint32_t now) {
 
 // ===== NEON =====
 //
-// A lit tube: bright, saturated, holding a color, with the occasional brief
-// flicker. Colors cross-fade into each other.
+// A lit tube: full brightness, holding a color, then a quick fade to the next.
+// No brightness variation at all.
 //
-// The first version of this burst 3-9 hard on/off blips and then changed color
-// on the way out of the burst, so every colour change arrived through a strobe.
-// It was jarring, and worse, it made the flicker read as the transition rather
-// than as a property of the tube. Two things are fixed, separately:
+// This effect shipped twice with a flicker in it, on the theory that a stutter
+// is what makes neon read as neon. On a strip of 240 LEDs that is true. On 8
+// diffused LEDs it is the whole lamp going dim at once, which is not a tube
+// struggling to strike -- it is a light with a fault. Softening it helped and
+// did not fix it, because the problem was the idea, not the depth.
 //
-//   - The dip is one brief dim, not a burst, and it never goes fully dark. A
-//     tube that is failing that badly is a fault, not an effect.
-//   - The dip is SUPPRESSED during a cross-fade. A change of colour is the one
-//     moment the eye is already tracking, and a flicker on top of it is what
-//     made this unwatchable.
-//
-// What is left is a lamp that mostly sits still, shifts colour smoothly, and
-// every few seconds does the small stutter that says "gas, not LED".
-inline void renderNeon(EffectState &s, uint32_t now, uint32_t legMs, uint32_t fadeMs) {
+// What distinguishes it from blend is now the SHAPE of the change rather than
+// any texture: blend is always drifting, easing through the whole leg and never
+// quite still, while neon sits rock steady on a color and then switches. A neon
+// sign does not fade up and down. It is on, in one color, until it is another.
+inline void renderNeon(EffectState &s, uint32_t legMs, uint32_t fadeMs) {
     uint8_t from = (s.phase / legMs) % s.colorCount;
     uint8_t to = (uint8_t)((from + 1) % s.colorCount);
 
     // A leg is mostly hold, with the cross-fade at the end of it.
     uint32_t into = s.phase % legMs;
     uint32_t holdMs = legMs > fadeMs ? legMs - fadeMs : 0;
-    bool fading = into >= holdMs;
-    uint8_t frac = fading ? (uint8_t)(((into - holdMs) * 255UL) / fadeMs) : 0;
+    uint8_t frac = into >= holdMs ? (uint8_t)(((into - holdMs) * 255UL) / fadeMs) : 0;
 
     CHSV color = blendColor(s.colors[from], s.colors[to], ease8InOutCubic(frac));
-
-    // blinks doubles as "currently dipped", since a dip is now a single state
-    // rather than a countdown of blips.
-    if (timeReached(now, s.timeouts[0])) {
-        if (s.blinks) {
-            s.blinks = 0;
-            s.value = 255;
-            s.timeouts[0] = now + random16(2500, 6000);
-        } else if (fading) {
-            // Not during a colour change. Checked again shortly, rather than
-            // rescheduled far out, so a dip is not skipped for long.
-            s.timeouts[0] = now + 250;
-        } else {
-            s.blinks = 1;
-            s.value = (uint8_t)random16(120, 170);
-            s.timeouts[0] = now + random16(50, 90);
-        }
-    }
-
-    color.v = s.value;
     for (uint8_t i = 0; i < s.numLeds; i++) s.leds[i] = color;
 }
 

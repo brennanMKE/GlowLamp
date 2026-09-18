@@ -7,6 +7,7 @@
 #include <esp_log.h>
 
 #include "effects.h"
+#include "favicon.h"
 #include "lamp.h"
 #include "mqtt.h"
 #include "ota.h"
@@ -123,6 +124,23 @@ void LampSettings::registerRoutes() {
     server.on("/settings", HTTP_GET, std::bind(&LampSettings::handleSettingsGet, this));
     server.on("/settings", HTTP_POST, std::bind(&LampSettings::handleSettingsSave, this));
     server.on("/help", HTTP_GET, std::bind(&LampSettings::handleHelp, this));
+
+    // Browsers ask for /favicon.ico on their own, whatever the page links to,
+    // and EasyWiFi's pages are served from here too -- so registering the route
+    // gives the WiFi setup screens the icon as well, without touching them.
+    //
+    // The content type is image/png regardless of the .ico name: what a browser
+    // does with this is decided by the bytes, not the path.
+    server.on("/favicon.ico", HTTP_GET, [this]() {
+        WebServer &s = configServer.getServer();
+        s.sendHeader("Cache-Control", "max-age=86400");
+        s.send_P(200, "image/png", (const char *)FAVICON_32_PNG, sizeof(FAVICON_32_PNG));
+    });
+    server.on("/icon-180.png", HTTP_GET, [this]() {
+        WebServer &s = configServer.getServer();
+        s.sendHeader("Cache-Control", "max-age=86400");
+        s.send_P(200, "image/png", (const char *)FAVICON_180_PNG, sizeof(FAVICON_180_PNG));
+    });
     server.on("/reboot", HTTP_POST, std::bind(&LampSettings::handleReboot, this));
 
     // ===== REST API =====
@@ -492,8 +510,7 @@ void LampSettings::handleApiEffects() {
         "Walks the palette steadily, never resting on a color.",
         "Similar colors mixing and guttering, like a flame. The one effect that "
         "lights the ring several colors at once.",
-        "One color, bright and steady, with an occasional brief flicker. Colors "
-        "cross-fade.",
+        "One color at full brightness, held steady, switching cleanly to the next.",
     };
     for (uint8_t i = 0; i < EFFECT_COUNT; i++) {
         JsonObject e = list.add<JsonObject>();
@@ -698,6 +715,11 @@ void LampSettings::handleApiReboot() {
 // has nothing for <h2> (its own pages have no subheadings), for tables, or for
 // a range slider. Those get rules here so these pages still look like the WiFi
 // setup screens they sit next to.
+static const char *HEAD_LINKS =
+    "<link rel='icon' type='image/png' href='/favicon.ico'>"
+    "<link rel='apple-touch-icon' href='/icon-180.png'>"
+    "<meta name='theme-color' content='#111111'>";
+
 static const char *EXTRA_CSS =
     "<style>"
     "h2{font-size:16px;margin:24px 0 4px;color:#333;"
@@ -740,6 +762,7 @@ String LampSettings::page(const String &title, const String &bodyHtml) {
     // getHTMLHeader() already closes </head> and opens <body>, so the page only
     // supplies the card itself.
     String html = webPages->getHTMLHeader(title);
+    html += HEAD_LINKS;
     html += EXTRA_CSS;
     html += "<div class='card'>";
     html += "<h1>" + title + "</h1>";
@@ -911,7 +934,7 @@ void LampSettings::handleEffectsPage() {
         "holds a color, eases to the next",
         "walks the palette, never resting",
         "mixes similar colors, like a flame",
-        "bright and steady, flickers now and then",
+        "steady and bright, switches cleanly",
     };
     b += "<div id='fxbuttons'>";
     for (uint8_t i = 0; i < EFFECT_COUNT; i++) {

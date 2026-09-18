@@ -108,7 +108,7 @@ restores whatever was showing, so identifying a lamp that is off leaves it off.
 |-
 | <code>flicker</code> || Similar colors mixing and guttering, like a flame. The one effect that lights the ring several colors at once.
 |-
-| <code>neon</code> || One color, bright and steady, with an occasional brief flicker. Colors cross-fade.
+| <code>neon</code> || One color at full brightness, held steady, switching cleanly to the next.
 |}
 
 Set from <code>http://<lamp>/effects</code>, which carries one-tap presets (Flame,

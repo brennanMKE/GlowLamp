@@ -42,6 +42,7 @@ private:
     void handleGet();
     void handleSave();
     void handleOtaCheck();
+    void handleOtaInstall();
     void handleReboot();
 
     // Wraps body content in EasyWiFi's card + header/footer chrome so these

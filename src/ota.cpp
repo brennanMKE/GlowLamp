@@ -78,15 +78,107 @@ static const char GITHUB_ROOT_CAS[] PROGMEM =
 
 static Preferences prefs;
 
-// Set from the web handler, acted on in loopOta(). See ota.h.
+// Set from the web handlers, acted on in loopOta(). See ota.h.
 static bool checkRequested = false;
+static bool installRequested = false;
+
+// Everything the status page shows. `state` is a pointer to a literal rather
+// than a String so reading it from the web handler cannot race a reallocation.
+static const char *state = "idle";
+static String latestTag;
+static String lastError;
+static uint32_t lastCheckAt = 0;
+static bool haveChecked = false;
 
 void requestOtaCheck() { checkRequested = true; }
+void requestOtaInstall() { installRequested = true; }
 
-// Download and flash whatever is at `url`, unconditionally -- the caller decides
+const char *otaState() { return state; }
+String otaLatestTag() { return latestTag; }
+String otaLastError() { return lastError; }
+
+bool otaUpdateAvailable() {
+    return latestTag.length() > 0 && latestTag != String(FIRMWARE_VERSION);
+}
+
+int32_t otaSecondsSinceCheck() {
+    if (!haveChecked) return -1;
+    return (int32_t)((millis() - lastCheckAt) / 1000);
+}
+
+// Ask GitHub what the latest release is. Sets latestTag on success and
+// lastError on failure; flashes nothing either way. Returns true if the answer
+// is now known.
+//
+// Until the repo has a release the API answers 404, which is reported as
+// "no releases published yet" rather than as a fault -- it is the expected
+// state of a new repo, not a broken lamp.
+static bool fetchLatestTag() {
+    state = "checking";
+    ESP_LOGI(TAG, "checking for update (running %s)", FIRMWARE_VERSION);
+
+    WiFiClientSecure client;
+    client.setCACert(GITHUB_ROOT_CAS);
+
+    HTTPClient http;
+    String api = String("https://api.github.com/repos/") + OTA_GITHUB_REPO + "/releases/latest";
+    http.begin(client, api);
+    http.addHeader("User-Agent", "GlowLamp-OTA");
+    int code = http.GET();
+    if (code != HTTP_CODE_OK) {
+        lastError = code == HTTP_CODE_NOT_FOUND ? String("no releases published yet")
+                                                : String("GitHub returned HTTP ") + code;
+        ESP_LOGW(TAG, "%s", lastError.c_str());
+        http.end();
+        state = "error";
+        lastCheckAt = millis();
+        haveChecked = true;
+        return false;
+    }
+
+    // Scan for tag_name by hand. The release payload is tens of KB of fields we
+    // do not want and would have to filter or size a JSON document for; two
+    // indexOf calls are smaller and cannot fail on an unexpectedly large
+    // response. ArduinoJson is not linked into this firmware at all.
+    String body = http.getString();
+    http.end();
+
+    int idx = body.indexOf("\"tag_name\"");
+    int q1 = idx < 0 ? -1 : body.indexOf('"', idx + 10);
+    int q2 = q1 < 0 ? -1 : body.indexOf('"', q1 + 1);
+    if (q2 < 0) {
+        lastError = "could not parse tag_name from the GitHub response";
+        ESP_LOGW(TAG, "%s", lastError.c_str());
+        state = "error";
+        lastCheckAt = millis();
+        haveChecked = true;
+        return false;
+    }
+
+    latestTag = body.substring(q1 + 1, q2);
+    if (latestTag.length() > 0 && latestTag[0] == 'v') latestTag = latestTag.substring(1);
+
+    lastError = "";
+    state = "idle";
+    lastCheckAt = millis();
+    haveChecked = true;
+    ESP_LOGI(TAG, "latest tag=%s, running=%s%s", latestTag.c_str(), FIRMWARE_VERSION,
+             otaUpdateAvailable() ? " (update available)" : " (up to date)");
+    return true;
+}
+
+// Download and flash the latest release, unconditionally -- the caller decides
 // whether an update is warranted. Returns only on failure; success reboots.
-static void performOtaFromUrl(const String &url) {
+//
+// This blocks the whole loop for the 10-30 s of the download, so the web server
+// answers nothing while it runs and the LEDs hold their last color. A browser
+// watching the status page simply sees the lamp stop responding and then come
+// back on the new version, which is why the page says so before starting.
+static void performOtaInstall() {
+    String url = String("https://github.com/") + OTA_GITHUB_REPO +
+                 "/releases/latest/download/firmware.bin";
     ESP_LOGI(TAG, "downloading firmware from %s", url.c_str());
+    state = "installing";
 
     WiFiClientSecure client;
     client.setCACert(GITHUB_ROOT_CAS);
@@ -112,66 +204,21 @@ static void performOtaFromUrl(const String &url) {
             break;
         case HTTP_UPDATE_NO_UPDATES:
             ESP_LOGI(TAG, "server says no update needed");
+            state = "idle";
             break;
         case HTTP_UPDATE_FAILED:
-            ESP_LOGE(TAG, "failed, error=%d: %s", httpUpdate.getLastError(),
-                     httpUpdate.getLastErrorString().c_str());
+            lastError = httpUpdate.getLastErrorString();
+            ESP_LOGE(TAG, "failed, error=%d: %s", httpUpdate.getLastError(), lastError.c_str());
+            state = "error";
             break;
     }
 }
 
-// Ask GitHub for the latest release tag and flash it if it differs from what is
-// running. Tag comparison, not ordering: a deliberate rollback to an older
-// release is an update too.
-//
-// Until the repo has its first release the API answers 404, which logs a warning
-// and returns -- the lamp keeps running whatever it was flashed with.
-static void checkForOtaUpdate() {
-    ESP_LOGI(TAG, "checking for update (running %s)", FIRMWARE_VERSION);
-
-    WiFiClientSecure client;
-    client.setCACert(GITHUB_ROOT_CAS);
-
-    HTTPClient http;
-    String api = String("https://api.github.com/repos/") + OTA_GITHUB_REPO + "/releases/latest";
-    http.begin(client, api);
-    http.addHeader("User-Agent", "GlowLamp-OTA");
-    int code = http.GET();
-    if (code != HTTP_CODE_OK) {
-        ESP_LOGW(TAG, "GitHub API returned HTTP %d", code);
-        http.end();
-        return;
-    }
-
-    // Scan for tag_name by hand. The release payload is tens of KB of fields we
-    // do not want and would have to filter or size a JSON document for; two
-    // indexOf calls are smaller and cannot fail on an unexpectedly large
-    // response. ArduinoJson is not linked into this firmware at all.
-    String body = http.getString();
-    http.end();
-
-    int idx = body.indexOf("\"tag_name\"");
-    if (idx < 0) {
-        ESP_LOGW(TAG, "tag_name not found in response");
-        return;
-    }
-    int q1 = body.indexOf('"', idx + 10);
-    int q2 = body.indexOf('"', q1 + 1);
-    if (q1 < 0 || q2 < 0) {
-        ESP_LOGW(TAG, "could not parse tag_name");
-        return;
-    }
-    String tag = body.substring(q1 + 1, q2);
-    if (tag.length() > 0 && tag[0] == 'v') tag = tag.substring(1);
-
-    ESP_LOGI(TAG, "latest tag=%s, running=%s", tag.c_str(), FIRMWARE_VERSION);
-    if (tag == String(FIRMWARE_VERSION)) {
-        ESP_LOGI(TAG, "already up to date");
-        return;
-    }
-
-    performOtaFromUrl(String("https://github.com/") + OTA_GITHUB_REPO +
-                      "/releases/latest/download/firmware.bin");
+// The unattended path: check, and take the update if there is one. This is what
+// the startup and daily timers run -- nobody is watching, so there is no point
+// stopping to report an available update to an empty room.
+static void checkAndInstall() {
+    if (fetchLatestTag() && otaUpdateAvailable()) performOtaInstall();
 }
 
 void loopOta() {
@@ -187,11 +234,18 @@ void loopOta() {
         wifiUpAt = millis();
     }
 
-    // Operator requests first, so a manual check is not delayed behind the
-    // startup timer below.
+    // Operator requests first, so a manual action is not delayed behind the
+    // startup timer below. Install before check: if someone hits both, the one
+    // that actually changes something wins.
+    if (installRequested) {
+        installRequested = false;
+        checkRequested = false;
+        performOtaInstall();
+        return;
+    }
     if (checkRequested) {
         checkRequested = false;
-        checkForOtaUpdate();
+        fetchLatestTag();
         return;
     }
 
@@ -201,7 +255,7 @@ void loopOta() {
     static bool startupDone = false;
     if (!startupDone && (millis() - wifiUpAt) >= STARTUP_DELAY_MS) {
         startupDone = true;
-        checkForOtaUpdate();
+        checkAndInstall();
         return;
     }
     if (!startupDone) return;
@@ -222,12 +276,12 @@ void loopOta() {
     if (lastYday == now.tm_yday) return;  // already ran today
 
     // Persist BEFORE checking: a successful update reboots from inside
-    // checkForOtaUpdate() and never returns, so writing the day first is what
+    // checkAndInstall() and never returns, so writing the day first is what
     // keeps the once-a-day guard intact across that reboot.
     prefs.begin("glowlamp", false);
     prefs.putInt("ota_yday", now.tm_yday);
     prefs.end();
 
     ESP_LOGI(TAG, "daily check (yday=%d)", now.tm_yday);
-    checkForOtaUpdate();
+    checkAndInstall();
 }

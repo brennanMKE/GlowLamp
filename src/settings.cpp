@@ -56,7 +56,10 @@ void LampSettings::registerRoutes() {
     server.on("/status.json", HTTP_GET, std::bind(&LampSettings::handleStatusJson, this));
     server.on("/settings", HTTP_GET, std::bind(&LampSettings::handleGet, this));
     server.on("/settings", HTTP_POST, std::bind(&LampSettings::handleSave, this));
-    server.on("/ota", HTTP_POST, std::bind(&LampSettings::handleOtaCheck, this));
+    // Both are POST, and deliberately not GET: a link a browser can prefetch
+    // should not be able to reflash the lamp.
+    server.on("/ota/check", HTTP_POST, std::bind(&LampSettings::handleOtaCheck, this));
+    server.on("/ota/install", HTTP_POST, std::bind(&LampSettings::handleOtaInstall, this));
     server.on("/reboot", HTTP_POST, std::bind(&LampSettings::handleReboot, this));
 }
 
@@ -152,6 +155,30 @@ String LampSettings::page(const String &title, const String &bodyHtml) {
     return html;
 }
 
+// Error text comes from HTTPUpdate and the TLS stack, which are free to put a
+// quote or a backslash in it. Unescaped, one of those turns status.json into a
+// parse error and the page stops updating -- a failed update would take the
+// display that reports it down with it.
+static String jsonEscape(const String &in) {
+    String out;
+    out.reserve(in.length() + 8);
+    for (unsigned i = 0; i < in.length(); i++) {
+        char c = in[i];
+        if (c == '"' || c == '\\') {
+            out += '\\';
+            out += c;
+        } else if (c == '\n' || c == '\r' || c == '\t') {
+            out += ' ';
+        } else if ((uint8_t)c < 0x20) {
+            // Anything else in the control range is dropped rather than
+            // \u-escaped; none of it is meaningful in an error message.
+        } else {
+            out += c;
+        }
+    }
+    return out;
+}
+
 // The home page renders once and would then sit stale while the ring keeps
 // blending. This is polled from that page to refresh the live fields in place.
 void LampSettings::handleStatusJson() {
@@ -164,6 +191,17 @@ void LampSettings::handleStatusJson() {
     j += ",\"rssi\":" + String(online ? WiFi.RSSI() : 0);
     j += ",\"online\":";
     j += online ? "true" : "false";
+
+    // Firmware block: what is running, what GitHub has, and whether the two
+    // differ. find_devices.sh reads these too, so the same call serves the
+    // status page and the fleet scan.
+    j += ",\"version\":\"" FIRMWARE_VERSION "\"";
+    j += ",\"ota\":{\"state\":\"" + String(otaState()) + "\"";
+    j += ",\"latest\":\"" + otaLatestTag() + "\"";
+    j += ",\"available\":";
+    j += otaUpdateAvailable() ? "true" : "false";
+    j += ",\"checked\":" + String(otaSecondsSinceCheck());
+    j += ",\"error\":\"" + jsonEscape(otaLastError()) + "\"}";
     j += "}";
 
     // No-store: a cached status is worse than none, and some browsers will
@@ -209,8 +247,18 @@ void LampSettings::handleHome() {
 
     b += "<h2>Firmware</h2>";
     b += "<table>";
-    b += row("Version", FIRMWARE_VERSION);
+    b += row("Running", FIRMWARE_VERSION);
+    b += rowId("Latest release", "", "latest");
     b += "</table>";
+
+    // Filled in by the poller: the check result, and the update button when
+    // there is something to take. Rendered empty rather than server-side,
+    // because a check started from this page lands a second or two after the
+    // page itself does.
+    b += "<div id='otabox'></div>";
+    b += "<div class='button-group'>";
+    b += "<button id='checkbtn' class='button'>Check for updates</button>";
+    b += "</div>";
 
     b += "<div class='button-group'>";
     b += "<a href='/settings' class='button'>Settings</a>";
@@ -220,13 +268,49 @@ void LampSettings::handleHome() {
     // Poll once a second so the color swatch tracks the ring. Failures are
     // swallowed: a reboot or a dropped link should leave the last known values
     // on screen rather than blanking the page.
+    // One poller drives the whole page. Failures are swallowed: a reboot or a
+    // dropped link should leave the last known values on screen rather than
+    // blanking the page -- and during an install the lamp stops answering
+    // entirely, which is exactly when the last message on screen matters most.
     b += "<script>"
+         "var installing=false;"
+         "function esc(t){var d=document.createElement('div');d.textContent=t;return d.innerHTML;}"
+         "function otaBox(s){"
+         "var o=s.ota,b=document.getElementById('otabox'),btn=document.getElementById('checkbtn');"
+         "document.getElementById('latest').textContent=o.latest?o.latest:'\\u2014';"
+         "if(installing){return;}"
+         "btn.disabled=(o.state=='checking');"
+         "btn.textContent=o.state=='checking'?'Checking\\u2026':'Check for updates';"
+         "if(o.state=='error'&&o.error){"
+         "b.innerHTML=\"<div class='status warning'>Check failed: \"+esc(o.error)+\"</div>\";return;}"
+         "if(o.available){"
+         "b.innerHTML=\"<div class='status warning'>Version \"+esc(o.latest)+\" is available.</div>\"+"
+         "\"<div class='button-group'><button id='upbtn' class='button primary'>Update to \"+esc(o.latest)+\"</button></div>\";"
+         "document.getElementById('upbtn').onclick=install;return;}"
+         "if(o.checked>=0){b.innerHTML=\"<div class='status success'>Up to date.</div>\";return;}"
+         "b.innerHTML='';"
+         "}"
+         "function install(){"
+         "if(!confirm('Download and install the latest firmware? The lamp reboots when it finishes.'))return;"
+         "installing=true;"
+         "document.getElementById('checkbtn').disabled=true;"
+         "document.getElementById('otabox').innerHTML="
+         "\"<div class='loading'></div><div class='status'>Downloading and installing. The lamp stops \"+"
+         "\"answering for a minute, then reboots on the new version. This page recovers on its own.</div>\";"
+         "fetch('/ota/install',{method:'POST'}).catch(()=>{});"
+         "setTimeout(function(){location.reload();},45000);"
+         "}"
          "function u(){fetch('/status.json',{cache:'no-store'}).then(r=>r.json()).then(s=>{"
          "document.getElementById('color').textContent=s.color;"
          "document.getElementById('swatch').style.background=s.color;"
          "document.getElementById('bright').textContent=s.brightness+' / 255';"
          "document.getElementById('rssi').textContent=s.online?s.rssi+' dBm':'\\u2014';"
+         "otaBox(s);"
          "}).catch(()=>{});}"
+         "document.getElementById('checkbtn').onclick=function(){"
+         "document.getElementById('checkbtn').disabled=true;"
+         "document.getElementById('checkbtn').textContent='Checking\\u2026';"
+         "fetch('/ota/check',{method:'POST'}).catch(()=>{});};"
          "setInterval(u,1000);u();"
          "</script>";
 
@@ -258,15 +342,12 @@ void LampSettings::handleGet() {
     b += "<div class='button-group'><button type='submit' class='button primary'>Save</button></div>";
     b += "</form>";
 
-    // Separate forms: nesting them would submit the settings too.
+    // Separate form: nesting it would submit the settings too.
     b += "<hr>";
     b += "<h2>Firmware</h2>";
-    b += "<p>Running <code>" FIRMWARE_VERSION "</code>. The lamp checks GitHub for a "
-         "newer release once a day; this asks now.</p>";
-    b += "<form method='POST' action='/ota'>";
-    b += "<div class='button-group'>";
-    b += "<button type='submit' class='button primary'>Check for update</button>";
-    b += "</div></form>";
+    b += "<p>Running <code>" FIRMWARE_VERSION "</code>. The lamp checks GitHub once a "
+         "day on its own; the <a href='/'>status page</a> checks on demand and offers "
+         "the update when there is one.</p>";
 
     b += "<hr>";
     b += "<form method='POST' action='/reboot' onsubmit='return confirm(\"Reboot the lamp?\")'>";
@@ -323,20 +404,33 @@ void LampSettings::handleSave() {
     server.send(200, "text/html", page("Settings", b));
 }
 
-// Queue a check rather than run one here: a successful update reboots from
-// inside the download, and doing that from a request handler kills the socket
-// mid-response. loopOta() picks it up on the next pass.
+// Both handlers queue and return immediately. The work happens in loopOta() on
+// the next pass -- see ota.h for why neither can run inside a request handler.
+//
+// They answer JSON rather than a page, so the same endpoints serve the status
+// page's fetch() and a curl from a script. The body is the state at the moment
+// the request was queued, not the outcome; the caller polls /status.json for
+// that.
+
 void LampSettings::handleOtaCheck() {
     WebServer &server = configServer.getServer();
-    ESP_LOGI(TAG, "update check requested from web UI");
+    ESP_LOGI(TAG, "update check requested over HTTP");
     requestOtaCheck();
 
-    String b;
-    b += "<div class='status success'>Checking GitHub for a newer release.</div>";
-    b += "<p>If one is found the lamp downloads it and reboots, which takes a "
-         "minute or so. Watch the serial log for progress. Nothing happens if it "
-         "is already up to date.</p>";
-    b += "<div class='button-group'><a href='/' class='button primary'>Home</a></div>";
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(200, "application/json",
+                "{\"queued\":\"check\",\"version\":\"" FIRMWARE_VERSION "\"}");
+}
 
-    server.send(200, "text/html", page("Firmware", b));
+void LampSettings::handleOtaInstall() {
+    WebServer &server = configServer.getServer();
+    ESP_LOGI(TAG, "update install requested over HTTP (running %s, latest %s)", FIRMWARE_VERSION,
+             otaLatestTag().length() ? otaLatestTag().c_str() : "unknown");
+    requestOtaInstall();
+
+    // Answered before the download starts, because once it does this device
+    // stops serving anything until it reboots.
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(200, "application/json",
+                "{\"queued\":\"install\",\"version\":\"" FIRMWARE_VERSION "\"}");
 }

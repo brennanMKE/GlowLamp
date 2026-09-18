@@ -79,8 +79,8 @@ UI lives at:
 
 | Path | What |
 |---|---|
-| `/` | Status: current color, brightness, network, firmware version |
-| `/settings` | Hostname, brightness, update check, reboot |
+| `/` | Status: color, brightness, network, firmware, update check |
+| `/settings` | Hostname, brightness, reboot |
 | `/wifi` | EasyWiFi's own setup pages |
 
 ## Building
@@ -96,30 +96,88 @@ Copy `lib/Config/Config.h.sample` to `lib/Config/Config.h` before the first
 build — it is gitignored and holds the device name and the OTA repo. There are
 no secrets in it.
 
+## Finding the lamps
+
+```sh
+./scripts/find_devices.sh            # scan and report
+./scripts/find_devices.sh --check    # ask each lamp to check GitHub first
+./scripts/find_devices.sh --update   # install on every lamp with an update
+```
+
+Each lamp announces `_glowlamp._tcp` over mDNS, so the scan finds them without
+knowing an address. For each one it prints the URL, the resolved IP, the running
+firmware, the latest release that lamp knows about, and whether an update is
+waiting.
+
+Names are resolved through the mDNS responder rather than left to curl. A cold
+mDNS cache regularly takes longer to answer than curl's timeout, which made the
+first scan after a reboot report every lamp as unreachable and the second one
+work — indistinguishable from a flaky lamp, and not the lamp's fault.
+
+An unprovisioned lamp is not on the network at all and will not appear here.
+Look for its setup AP instead.
+
 ## OTA updates
 
-The lamp checks `https://github.com/<OTA_GITHUB_REPO>/releases/latest` for a
-release tag that differs from its own `FIRMWARE_VERSION`, downloads
-`firmware.bin` from it and reboots. Checks happen 15 seconds after joining WiFi,
-once a day at 15:00 local, and whenever the Settings page asks.
+A lamp can find out about a new release three ways:
+
+| Trigger | What it does |
+|---|---|
+| 15 s after joining WiFi | Checks, and installs if the tag differs |
+| Daily at 15:00 local | Same |
+| The status page, or `POST /ota/check` | Checks only, and reports |
+
+The first two are unattended, so they install on their own — nobody is watching,
+and there is no point holding an update back for an empty room. A check you
+asked for never installs anything: it tells you what is available and offers a
+button, so you can see what you are about to take.
+
+Mid-afternoon is deliberate rather than overnight: an update that goes wrong
+reboots the lamp, and 15:00 is when someone is around to notice. There is no
+rollback, so the hour is the only safety margin.
 
 Comparison is by tag equality, not ordering, so re-tagging an older release is a
-supported way to roll back.
+supported way to roll back — and a lamp running firmware *newer* than the latest
+release will install the older one. Cut the release before flashing a new
+version by hand, or the next check quietly undoes it.
 
-To cut a release:
+### From a script
+
+Both endpoints answer JSON and take POST, never GET — a link a browser can
+prefetch should not be able to reflash a lamp.
+
+```sh
+curl -X POST http://glow-lamp-051860.local/ota/check     # ask GitHub
+curl -s http://glow-lamp-051860.local/status.json        # read the answer
+curl -X POST http://glow-lamp-051860.local/ota/install   # take it
+```
+
+`status.json` carries the firmware block the scan and the status page both read:
+
+```json
+{"version":"0.0.2",
+ "ota":{"state":"idle","latest":"0.0.3","available":true,"checked":12,"error":""}}
+```
+
+`state` is `idle`, `checking`, `installing` or `error`, and `checked` is seconds
+since the last completed check (`-1` if none this boot).
+
+While a lamp installs, it answers nothing — the download blocks its loop for
+10–30 s and the ring holds its last color — and then it reboots on the new
+version. The status page says so before it starts and recovers on its own.
+
+### Cutting a release
 
 ```sh
 # bump FIRMWARE_VERSION in src/version.h first, and commit
-./scripts/release.sh 0.0.2
+./scripts/release.sh 0.0.3
+./scripts/find_devices.sh --update     # or let them find it themselves
 ```
 
 The script refuses to tag if the version does not match `src/version.h`, if the
 working tree is dirty, or if the binary would overflow the 1,966,080-byte OTA
 slot — a build that overflows uploads fine over USB and then fails silently over
 the air.
-
-Until the GitHub repo has its first release the check logs an HTTP 404 and
-carries on. Nothing else changes.
 
 ## License
 

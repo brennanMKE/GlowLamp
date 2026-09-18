@@ -1,0 +1,33 @@
+# Normalize line endings: store text as LF in the repo.
+* text=auto eol=lf
+
+# Source and config files are text.
+*.c     text eol=lf
+*.cpp   text eol=lf
+*.h     text eol=lf
+*.hpp   text eol=lf
+*.ino   text eol=lf
+*.ini   text eol=lf
+*.md    text eol=lf
+*.json  text eol=lf
+*.txt   text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+
+# Shell scripts must stay LF (CRLF breaks the shebang).
+*.sh    text eol=lf
+
+# Binary assets — never normalized or diffed as text.
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.bin   binary
+*.elf   binary
+
+# Collapse build noise in diffs and language stats.
+.pio/** linguist-generated
+
+# GitHub language stats: count headers as C++.
+*.h linguist-language=C++

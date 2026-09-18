@@ -435,4 +435,6 @@ secrets in it.
 | 0.0.4 || <code>/api/ota/update</code> for scheduled rollouts
 |-
 | 0.0.5 || Four effects, five-color palette, hue-based blending, bare hostnames, MQTT
+|-
+| 0.0.6 || <code>/effects</code> page with presets, favicon, steady neon, MQTT failure reporting
 |}

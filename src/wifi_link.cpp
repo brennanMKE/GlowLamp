@@ -42,7 +42,7 @@ void setupWifiLink() {
     // SSID from the name passed to setup(), so the stored one has to be loaded
     // before that call rather than after.
     settings.begin();
-    runloop.setup(settings.deviceName());
+    runloop.setup(settings.hostName());
     runloop.getConfigServer().registerCustomHandler(&settings);
 
     uint8_t mac[6];
@@ -66,14 +66,19 @@ void loopWifiLink() {
     if (!announced && WiFi.status() == WL_CONNECTED && millis() - nextTry >= 2000) {
         nextTry = millis();
         if (MDNS.addService(MDNS_SERVICE, "tcp", 80)) {
-            MDNS.addServiceTxt(MDNS_SERVICE, "tcp", "device", settings.deviceName().c_str());
+            // What a scan reads without opening a connection: the friendly
+            // name is here so two lamps can be told apart from the browse list
+            // alone, rather than by decoding a MAC suffix.
+            MDNS.addServiceTxt(MDNS_SERVICE, "tcp", "device", settings.hostName().c_str());
+            MDNS.addServiceTxt(MDNS_SERVICE, "tcp", "name", settings.displayName().c_str());
             MDNS.addServiceTxt(MDNS_SERVICE, "tcp", "fw", FIRMWARE_VERSION);
-            MDNS.addServiceTxt(MDNS_SERVICE, "tcp", "settings", "/settings");
+            MDNS.addServiceTxt(MDNS_SERVICE, "tcp", "api", "/api");
+            MDNS.addServiceTxt(MDNS_SERVICE, "tcp", "help", "/help");
             announced = true;
             uint8_t mac[6];
             WiFi.macAddress(mac);
             char buf[48];
-            snprintf(buf, sizeof(buf), "%s-%02x%02x%02x.local", settings.deviceName().c_str(),
+            snprintf(buf, sizeof(buf), "%s-%02x%02x%02x.local", settings.hostName().c_str(),
                      mac[3], mac[4], mac[5]);
             mdnsName = buf;
             ESP_LOGI(TAG, "announced _%s._tcp as %s", MDNS_SERVICE, mdnsName.c_str());

@@ -2,6 +2,7 @@
 #include <FastLED.h>
 #include <esp_log.h>
 
+#include "every_n_millis.h"
 #include "lamp.h"
 #include "ota.h"
 #include "settings.h"
@@ -42,15 +43,41 @@ static const uint8_t DEFAULT_BRIGHTNESS = 64;
 
 CRGB leds[NUM_LEDS];
 
+// How long the identify flash lasts by default, and how long each blink is.
+// 150 ms reads as a deliberate signal; much faster looks like a fault.
+static const uint32_t IDENTIFY_BLINK_MS = 150;
+
+// Identify at a floor brightness, so a lamp dimmed to 5 in a bright room still
+// announces itself. Restored to the configured value when the flash ends.
+static const uint8_t IDENTIFY_MIN_BRIGHTNESS = 160;
+
 // ===== State =====
 static uint8_t brightness = DEFAULT_BRIGHTNESS;
+static bool power = true;
 static CRGB currentColor = PALETTE[0];
 
+static bool identifying = false;
+static uint32_t identifyStart = 0;
+static uint32_t identifyEnd = 0;
+
 uint8_t lampBrightness() { return brightness; }
+bool lampPower() { return power; }
+bool lampIdentifying() { return identifying; }
 
 void setLampBrightness(uint8_t value) {
     brightness = value;
-    FastLED.setBrightness(brightness);
+    // Not applied while identifying: the flash owns the brightness until it
+    // ends, and would otherwise be dimmed mid-blink by a slider change.
+    if (!identifying) FastLED.setBrightness(brightness);
+}
+
+void setLampPower(bool on) { power = on; }
+
+void identifyLamp(uint32_t durationMs) {
+    identifyStart = millis();
+    identifyEnd = identifyStart + durationMs;
+    identifying = true;
+    FastLED.setBrightness(max(brightness, IDENTIFY_MIN_BRIGHTNESS));
 }
 
 String lampColorHex() {
@@ -87,7 +114,25 @@ static void loopLeds() {
     // colors as on the muddy midpoint between them.
     currentColor = blend(PALETTE[from], PALETTE[to], ease8InOutCubic(t));
 
-    fill_solid(leds, NUM_LEDS, currentColor);
+    // The cycle above keeps running whatever the lamp is showing, so power and
+    // identify only decide what gets rendered. Switching back on resumes the
+    // color the lamp would have been on, rather than restarting the cycle.
+    if (identifying) {
+        // timeReached() rather than a plain compare, and elapsed rather than an
+        // absolute deadline: both survive the millis() rollover. See
+        // include/every_n_millis.h.
+        if (timeReached(now, identifyEnd)) {
+            identifying = false;
+            FastLED.setBrightness(brightness);
+        } else {
+            bool lit = ((now - identifyStart) / IDENTIFY_BLINK_MS) % 2 == 0;
+            fill_solid(leds, NUM_LEDS, lit ? CRGB::White : CRGB::Black);
+            FastLED.show();
+            return;
+        }
+    }
+
+    fill_solid(leds, NUM_LEDS, power ? currentColor : CRGB::Black);
     FastLED.show();
 }
 
@@ -103,10 +148,12 @@ void setup() {
     ESP_LOGI(TAG, "%d LEDs on pin %d, %lu ms per blend", NUM_LEDS, DATA_PIN,
              (unsigned long)BLEND_MS);
 
-    // Brightness comes out of NVS, so setupWifiLink() (which calls
-    // settings.begin()) has to run before it is applied.
+    // Brightness and the power state come out of NVS, so setupWifiLink()
+    // (which calls settings.begin()) has to run before they are applied. A lamp
+    // switched off by Home Assistant comes back off after a power cut.
     setupWifiLink();
     setLampBrightness(settings.brightness());
+    setLampPower(settings.power());
 }
 
 void loop() {

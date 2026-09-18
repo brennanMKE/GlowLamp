@@ -79,8 +79,10 @@ UI lives at:
 
 | Path | What |
 |---|---|
-| `/` | Status: color, brightness, network, firmware, update check |
-| `/settings` | Hostname, brightness, reboot |
+| `/` | Status, and the controls: on/off, brightness, identify |
+| `/settings` | Firmware check and update, the same controls, names, reboot |
+| `/help` | The REST API, documented by the lamp itself |
+| `/api` | The same reference as JSON |
 | `/wifi` | EasyWiFi's own setup pages |
 
 ## Building
@@ -95,6 +97,60 @@ pio device monitor           # 115200
 Copy `lib/Config/Config.h.sample` to `lib/Config/Config.h` before the first
 build — it is gitignored and holds the device name and the OTA repo. There are
 no secrets in it.
+
+## Controlling a lamp
+
+Everything the web UI does is a REST call, so a script can do the same:
+
+```sh
+curl http://glow-lamp-051860.local/api/status
+curl -X POST http://glow-lamp-051860.local/api/power -d '{"on":false}'
+curl -X POST http://glow-lamp-051860.local/api/brightness -d '{"value":128}'
+curl -X POST http://glow-lamp-051860.local/api/identify -d '{"seconds":4}'
+```
+
+Values are accepted as a JSON body, a form field or a query parameter, and every
+mutating call answers with the same object `GET /api/status` returns — the new
+state never needs a second request. Anything that changes the lamp is POST only,
+so nothing a browser can prefetch can switch a lamp off or reflash it. There is
+no authentication: these are LAN devices, and anything that can reach one can
+control it.
+
+`http://<lamp>/help` is the full reference, served by the lamp so it always
+describes the firmware actually running. `/api` is the same thing as JSON, for
+an agent that would rather not read HTML.
+
+### Identify
+
+`POST /api/identify` blinks the ring white for a few seconds at a floor
+brightness, so a lamp dimmed to 5 in a bright room still announces itself. It
+overrides power and restores whatever was showing, so identifying a lamp that is
+switched off leaves it switched off.
+
+### Names
+
+A lamp has two:
+
+| | |
+|---|---|
+| **Name** | What you call it — "Living Room". Free text, announced over mDNS, takes effect immediately. Nothing is addressed by it. |
+| **Hostname** | The mDNS label. Lowercase, digits and hyphens. The lamp answers at `<hostname>-<mac>.local`, and its setup AP is named from it. Needs a reboot. |
+
+## Home Assistant
+
+`scripts/glowlamp.py` finds the lamps and drives them, using only the standard
+library so it runs under Home Assistant's Python:
+
+```sh
+./scripts/glowlamp.py discover
+./scripts/glowlamp.py off --all
+./scripts/glowlamp.py brightness 128 --name "Living Room"
+./scripts/glowlamp.py identify --host glow-lamp-051860.local
+```
+
+See [docs/home-assistant.md](docs/home-assistant.md) for the REST switch and
+`shell_command` configuration, including turning every lamp off with the rest of
+the house.
 
 ## Finding the lamps
 

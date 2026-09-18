@@ -1,5 +1,6 @@
 #include "settings.h"
 
+#include <ArduinoJson.h>
 #include <Config.h>
 #include <Preferences.h>
 #include <WiFi.h>
@@ -16,6 +17,10 @@ static const char *TAG = "SETTINGS";
 // this firmware persists.
 static const char *NVS_NS = "glowlamp";
 
+// How long the identify flash runs when the caller does not say.
+static const uint32_t IDENTIFY_DEFAULT_MS = 4000;
+static const uint32_t IDENTIFY_MAX_MS = 60000;
+
 void LampSettings::begin() {
     Preferences p;
     // Read-write, not read-only: opening a namespace that does not exist yet
@@ -25,14 +30,47 @@ void LampSettings::begin() {
     // isKey() before each read: getString() on a missing key logs an ESP_LOGE
     // before returning the default, which would make every first boot look like
     // a failure in the serial log.
-    name = p.isKey("name") ? p.getString("name") : String(DEVICE_NAME);
+    //
+    // "name" held the hostname before display names existed, and still does. A
+    // lamp that updates from an older build keeps the address it was reachable
+    // at; renaming the key here would have silently moved every deployed lamp.
+    host = p.isKey("name") ? p.getString("name") : String(DEVICE_NAME);
+    label = p.isKey("label") ? p.getString("label") : host;
     if (p.isKey("bright")) bright = p.getUChar("bright");
+    if (p.isKey("power")) on = p.getBool("power");
     p.end();
 
-    ESP_LOGI(TAG, "name=%s brightness=%u", name.c_str(), bright);
+    ESP_LOGI(TAG, "host=%s label=%s brightness=%u power=%s", host.c_str(), label.c_str(), bright,
+             on ? "on" : "off");
 }
 
-String LampSettings::sanitizeName(const String &in) {
+void LampSettings::saveBrightness(uint8_t value) {
+    bright = value;
+    Preferences p;
+    p.begin(NVS_NS, false);
+    p.putUChar("bright", bright);
+    p.end();
+}
+
+void LampSettings::savePower(bool value) {
+    on = value;
+    Preferences p;
+    p.begin(NVS_NS, false);
+    p.putBool("power", on);
+    p.end();
+}
+
+void LampSettings::saveNames(const String &newLabel, const String &newHost) {
+    label = newLabel;
+    host = newHost;
+    Preferences p;
+    p.begin(NVS_NS, false);
+    p.putString("label", label);
+    p.putString("name", host);
+    p.end();
+}
+
+String LampSettings::sanitizeHost(const String &in) {
     String out;
     for (unsigned i = 0; i < in.length() && out.length() < 18; i++) {
         char c = in[i];
@@ -49,29 +87,596 @@ String LampSettings::sanitizeName(const String &in) {
 
 void LampSettings::registerRoutes() {
     WebServer &server = configServer.getServer();
+
     // EasyWiFi registers /wifi* and a catch-all 404, but leaves the device root
     // to the application -- its own 404 page even advertises "/" as the device
     // home page. Without this, the bare hostname 404s.
     server.on("/", HTTP_GET, std::bind(&LampSettings::handleHome, this));
-    server.on("/status.json", HTTP_GET, std::bind(&LampSettings::handleStatusJson, this));
-    server.on("/settings", HTTP_GET, std::bind(&LampSettings::handleGet, this));
-    server.on("/settings", HTTP_POST, std::bind(&LampSettings::handleSave, this));
-    // Both are POST, and deliberately not GET: a link a browser can prefetch
-    // should not be able to reflash the lamp.
-    server.on("/ota/check", HTTP_POST, std::bind(&LampSettings::handleOtaCheck, this));
-    server.on("/ota/install", HTTP_POST, std::bind(&LampSettings::handleOtaInstall, this));
+    server.on("/settings", HTTP_GET, std::bind(&LampSettings::handleSettingsGet, this));
+    server.on("/settings", HTTP_POST, std::bind(&LampSettings::handleSettingsSave, this));
+    server.on("/help", HTTP_GET, std::bind(&LampSettings::handleHelp, this));
     server.on("/reboot", HTTP_POST, std::bind(&LampSettings::handleReboot, this));
+
+    // ===== REST API =====
+    // Mutating calls are POST, never GET: a link a browser can prefetch should
+    // not be able to switch a lamp off or reflash it.
+    server.on("/api", HTTP_GET, std::bind(&LampSettings::handleApiIndex, this));
+    server.on("/api/status", HTTP_GET, std::bind(&LampSettings::handleApiStatus, this));
+    server.on("/api/power", HTTP_POST, std::bind(&LampSettings::handleApiPower, this));
+    server.on("/api/brightness", HTTP_POST, std::bind(&LampSettings::handleApiBrightness, this));
+    server.on("/api/identify", HTTP_POST, std::bind(&LampSettings::handleApiIdentify, this));
+    server.on("/api/name", HTTP_POST, std::bind(&LampSettings::handleApiName, this));
+    server.on("/api/ota/check", HTTP_POST, std::bind(&LampSettings::handleApiOtaCheck, this));
+    server.on("/api/ota/install", HTTP_POST, std::bind(&LampSettings::handleApiOtaInstall, this));
+    server.on("/api/reboot", HTTP_POST, std::bind(&LampSettings::handleApiReboot, this));
+
+    // Kept from 0.0.2, which shipped these paths and a find_devices.sh that
+    // calls them. A lamp that has not been updated yet is still on the network
+    // alongside one that has, and the scan has to work against both.
+    server.on("/status.json", HTTP_GET, std::bind(&LampSettings::handleApiStatus, this));
+    server.on("/ota/check", HTTP_POST, std::bind(&LampSettings::handleApiOtaCheck, this));
+    server.on("/ota/install", HTTP_POST, std::bind(&LampSettings::handleApiOtaInstall, this));
 }
 
-// The .local name this device will answer to after a reboot. Computed from the
-// *current* setting rather than read back from mDNS, so a rename that has not
-// taken effect yet still produces the address to come back to.
-String LampSettings::expectedHostname() const {
-    uint8_t mac[6];
-    WiFi.macAddress(mac);
-    char buf[48];
-    snprintf(buf, sizeof(buf), "%s-%02x%02x%02x.local", name.c_str(), mac[3], mac[4], mac[5]);
-    return String(buf);
+// ===========================================================================
+// Request parameters
+// ===========================================================================
+//
+// A value may arrive three ways: a JSON body (what an agent or Home Assistant
+// sends), a form field (the settings page), or a query parameter (the shortest
+// thing to type into curl). All three are accepted everywhere, so no caller has
+// to be told which style this lamp expects.
+//
+// ESP32's WebServer parses form and query parameters into args, and puts an
+// unparsed body -- which is what a JSON request is -- into the "plain" arg.
+namespace {
+
+class Params {
+public:
+    explicit Params(WebServer &server) : server(server) {
+        if (server.hasArg("plain")) {
+            // A body that is not JSON is not an error here: it may simply be a
+            // form post, whose fields are already in args.
+            deserializeJson(doc, server.arg("plain"));
+        }
+    }
+
+    bool has(const char *key) const { return !doc[key].isNull() || server.hasArg(key); }
+
+    String str(const char *key, const String &fallback = String()) const {
+        if (!doc[key].isNull()) return doc[key].as<String>();
+        if (server.hasArg(key)) return server.arg(key);
+        return fallback;
+    }
+
+    long num(const char *key, long fallback) const {
+        if (doc[key].is<long>()) return doc[key].as<long>();
+        String s = str(key);
+        return s.length() ? s.toInt() : fallback;
+    }
+
+    // Accepts real booleans, 0/1, and the words people and shell scripts
+    // actually type. Anything unrecognized leaves the fallback in place rather
+    // than silently meaning "off".
+    bool flag(const char *key, bool fallback) const {
+        if (doc[key].is<bool>()) return doc[key].as<bool>();
+        String s = str(key);
+        s.toLowerCase();
+        if (s == "1" || s == "true" || s == "on" || s == "yes") return true;
+        if (s == "0" || s == "false" || s == "off" || s == "no") return false;
+        return fallback;
+    }
+
+private:
+    WebServer &server;
+    JsonDocument doc;
+};
+
+}  // namespace
+
+// ===========================================================================
+// Status
+// ===========================================================================
+
+String LampSettings::statusJson(bool pretty) const {
+    JsonDocument doc;
+
+    doc["name"] = label;
+    doc["hostname"] = host;
+    doc["mdns"] = String(MDNS_HOSTNAME_HINT);
+    doc["version"] = FIRMWARE_VERSION;
+
+    // Home Assistant's light convention: a lamp that is off keeps the
+    // brightness it will come back on at.
+    doc["power"] = lampPower() ? "on" : "off";
+    doc["on"] = lampPower();
+    doc["brightness"] = lampBrightness();
+    doc["color"] = lampColorHex();
+    doc["identifying"] = lampIdentifying();
+
+    bool online = WiFi.status() == WL_CONNECTED;
+    JsonObject net = doc["network"].to<JsonObject>();
+    net["online"] = online;
+    net["ssid"] = online ? WiFi.SSID() : String();
+    net["ip"] = online ? WiFi.localIP().toString() : String();
+    net["rssi"] = online ? WiFi.RSSI() : 0;
+    net["mac"] = WiFi.macAddress();
+
+    JsonObject ota = doc["ota"].to<JsonObject>();
+    ota["state"] = otaState();
+    ota["latest"] = otaLatestTag();
+    ota["available"] = otaUpdateAvailable();
+    ota["checked"] = otaSecondsSinceCheck();
+    // Error text comes from HTTPUpdate and the TLS stack, which are free to put
+    // a quote or a backslash in it. ArduinoJson escapes it; the hand-rolled
+    // version of this that 0.0.2 shipped had to do that itself.
+    ota["error"] = otaLastError();
+
+    doc["uptime"] = millis() / 1000;
+
+    String out;
+    if (pretty) {
+        serializeJsonPretty(doc, out);
+    } else {
+        serializeJson(doc, out);
+    }
+    return out;
+}
+
+void LampSettings::sendStatus() {
+    WebServer &server = configServer.getServer();
+    // No-store: a cached status is worse than none, and some browsers will
+    // happily serve one back for a bare GET on a small unchanging URL.
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(200, "application/json", statusJson());
+}
+
+void LampSettings::handleApiStatus() {
+    WebServer &server = configServer.getServer();
+    server.sendHeader("Cache-Control", "no-store");
+    // Pretty-printed when a person opens it in a browser, compact for the
+    // pollers. `pretty=0` forces the compact form.
+    bool pretty = server.hasArg("pretty") ? server.arg("pretty") != "0" : true;
+    server.send(200, "application/json", statusJson(pretty));
+}
+
+// ===========================================================================
+// REST API
+// ===========================================================================
+
+// The machine-readable counterpart of /help: an agent that finds a lamp can ask
+// what it supports without being taught the endpoints beforehand.
+void LampSettings::handleApiIndex() {
+    WebServer &server = configServer.getServer();
+
+    JsonDocument doc;
+    doc["name"] = label;
+    doc["hostname"] = host;
+    doc["version"] = FIRMWARE_VERSION;
+    doc["help"] = "/help";
+    doc["mdns_service"] = "_" MDNS_SERVICE "._tcp";
+
+    JsonArray eps = doc["endpoints"].to<JsonArray>();
+    auto add = [&eps](const char *method, const char *path, const char *body, const char *what) {
+        JsonObject e = eps.add<JsonObject>();
+        e["method"] = method;
+        e["path"] = path;
+        if (body[0]) e["body"] = body;
+        e["description"] = what;
+    };
+    add("GET", "/api", "", "This index.");
+    add("GET", "/api/status", "", "Full lamp state. Add ?pretty=0 for compact JSON.");
+    add("POST", "/api/power", "{\"on\": true | false | \"toggle\"}", "Switch the lamp on or off. Persists.");
+    add("POST", "/api/brightness", "{\"value\": 0-255}", "Set brightness. Persists. Does not switch the lamp on.");
+    add("POST", "/api/identify", "{\"seconds\": 1-60}", "Blink white so you can find this lamp.");
+    add("POST", "/api/name", "{\"name\": \"Living Room\", \"hostname\": \"glow-lamp\"}",
+        "Rename. A changed hostname needs a reboot to take effect.");
+    add("POST", "/api/ota/check", "", "Ask GitHub for the latest release. Installs nothing.");
+    add("POST", "/api/ota/install", "", "Install the latest release, then reboot.");
+    add("POST", "/api/reboot", "", "Reboot the lamp.");
+
+    doc["notes"]["responses"] =
+        "Every mutating call returns the same object as GET /api/status, so the new state "
+        "never needs a second request.";
+    doc["notes"]["parameters"] =
+        "Values are accepted as a JSON body, a form field, or a query parameter.";
+    doc["notes"]["methods"] =
+        "Mutating calls are POST only, so nothing a browser can prefetch changes the lamp.";
+
+    String out;
+    serializeJsonPretty(doc, out);
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(200, "application/json", out);
+}
+
+void LampSettings::handleApiPower() {
+    Params p(configServer.getServer());
+
+    // "toggle" is a string where the others are booleans, so it is checked
+    // before flag() reduces the value to true/false.
+    String raw = p.str("on");
+    raw.toLowerCase();
+    bool want = raw == "toggle" ? !lampPower() : p.flag("on", !lampPower());
+
+    setLampPower(want);
+    savePower(want);
+    ESP_LOGI(TAG, "power %s over the API", want ? "on" : "off");
+    sendStatus();
+}
+
+void LampSettings::handleApiBrightness() {
+    WebServer &server = configServer.getServer();
+    Params p(server);
+
+    // "value" is the documented name; "brightness" is what anyone who read
+    // status.json first will reach for.
+    long v = p.has("value") ? p.num("value", bright) : p.num("brightness", bright);
+    if (v < 0 || v > 255) {
+        server.send(400, "application/json",
+                    "{\"error\":\"brightness must be between 0 and 255\"}");
+        return;
+    }
+
+    setLampBrightness((uint8_t)v);
+    saveBrightness((uint8_t)v);
+    ESP_LOGI(TAG, "brightness %ld over the API", v);
+    sendStatus();
+}
+
+void LampSettings::handleApiIdentify() {
+    Params p(configServer.getServer());
+
+    uint32_t ms = IDENTIFY_DEFAULT_MS;
+    if (p.has("seconds")) ms = (uint32_t)p.num("seconds", 4) * 1000;
+    if (p.has("ms")) ms = (uint32_t)p.num("ms", (long)IDENTIFY_DEFAULT_MS);
+    if (ms < 100) ms = 100;
+    if (ms > IDENTIFY_MAX_MS) ms = IDENTIFY_MAX_MS;  // nobody meant to blink it for an hour
+
+    identifyLamp(ms);
+    ESP_LOGI(TAG, "identify for %lu ms", (unsigned long)ms);
+    sendStatus();
+}
+
+void LampSettings::handleApiName() {
+    WebServer &server = configServer.getServer();
+    Params p(server);
+
+    String newLabel = p.str("name", label);
+    newLabel.trim();
+    if (newLabel.length() == 0) newLabel = label;
+    if (newLabel.length() > 32) newLabel = newLabel.substring(0, 32);
+
+    String newHost = host;
+    if (p.has("hostname")) {
+        String clean = sanitizeHost(p.str("hostname"));
+        // A hostname that sanitizes away to nothing is a bad request, not a
+        // reason to leave the lamp unreachable under a name nobody chose.
+        if (clean.length() == 0) {
+            server.send(400, "application/json",
+                        "{\"error\":\"hostname must contain a letter or digit\"}");
+            return;
+        }
+        newHost = clean;
+    }
+
+    bool hostChanged = newHost != host;
+    saveNames(newLabel, newHost);
+    ESP_LOGI(TAG, "renamed: label=%s host=%s%s", label.c_str(), host.c_str(),
+             hostChanged ? " (reboot to publish)" : "");
+    sendStatus();
+}
+
+void LampSettings::handleApiOtaCheck() {
+    ESP_LOGI(TAG, "update check requested over HTTP");
+    requestOtaCheck();
+    sendStatus();
+}
+
+void LampSettings::handleApiOtaInstall() {
+    ESP_LOGI(TAG, "update install requested over HTTP (running %s, latest %s)", FIRMWARE_VERSION,
+             otaLatestTag().length() ? otaLatestTag().c_str() : "unknown");
+    requestOtaInstall();
+    // Answered before the download starts, because once it does this device
+    // stops serving anything until it reboots.
+    sendStatus();
+}
+
+void LampSettings::handleApiReboot() {
+    WebServer &server = configServer.getServer();
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(200, "application/json", "{\"rebooting\":true}");
+    server.client().flush();
+    delay(250);  // let the response reach the caller before the reset
+    ESP.restart();
+}
+
+// ===========================================================================
+// Pages
+// ===========================================================================
+
+// EasyWiFi's stylesheet covers .card, .form-group, .button and text inputs, but
+// has nothing for <h2> (its own pages have no subheadings), for tables, or for
+// a range slider. Those get rules here so these pages still look like the WiFi
+// setup screens they sit next to.
+static const char *EXTRA_CSS =
+    "<style>"
+    "h2{font-size:16px;margin:24px 0 4px;color:#333;"
+    "text-transform:uppercase;letter-spacing:.04em;}"
+    "h2:first-of-type{margin-top:8px;}"
+    "hr{border:0;border-top:1px solid #eee;margin:24px 0;}"
+    "code{background:#f0f0f0;padding:1px 4px;border-radius:4px;}"
+    "pre{background:#f7f7f7;padding:12px;border-radius:8px;overflow-x:auto;"
+    "font-size:13px;line-height:1.5;}"
+    "pre code{background:none;padding:0;}"
+    "table{width:100%;border-collapse:collapse;margin:8px 0 4px;}"
+    "th,td{text-align:left;padding:8px 0;border-bottom:1px solid #eee;font-size:15px;}"
+    "th{color:#666;font-weight:500;width:40%;}"
+    "td{color:#333;}"
+    "input[type=range]{width:100%;}"
+    "#swatch{display:inline-block;width:14px;height:14px;border-radius:50%;"
+    "margin-right:8px;vertical-align:-2px;border:1px solid rgba(0,0,0,.15);}"
+    ".api{font-size:14px;margin:0 0 18px;}"
+    ".api b{font-family:ui-monospace,Menlo,monospace;font-size:13px;}"
+    "</style>";
+
+String LampSettings::page(const String &title, const String &bodyHtml) {
+    // getHTMLHeader() already closes </head> and opens <body>, so the page only
+    // supplies the card itself.
+    String html = webPages->getHTMLHeader(title);
+    html += EXTRA_CSS;
+    html += "<div class='card'>";
+    html += "<h1>" + title + "</h1>";
+    html += bodyHtml;
+    html += "</div>";
+    html += webPages->getHTMLFooter();
+    return html;
+}
+
+// One row of a status table. Kept out of the page builders so the markup for a
+// missing value is written once.
+static String row(const String &label, const String &value) {
+    return "<tr><th>" + label + "</th><td>" + (value.length() ? value : String("&mdash;")) + "</td></tr>";
+}
+
+// Same, with an id on the value cell so the poller can rewrite it.
+static String rowId(const String &label, const String &value, const char *id) {
+    return "<tr><th>" + label + "</th><td id='" + id + "'>" +
+           (value.length() ? value : String("&mdash;")) + "</td></tr>";
+}
+
+// The controls shared by the status page and the settings page: power,
+// brightness and identify. Written once because both pages carry them -- the
+// status page is where you land, the settings page is where you are when you
+// need to tell one lamp from another.
+//
+// Every control calls the REST API and renders the state that comes back, so
+// the page and a script driving the same lamp never disagree.
+static String controlsHtml() {
+    String b;
+    b += "<h2>Light</h2>";
+    b += "<div class='button-group'>";
+    b += "<button id='powerbtn' class='button primary'>&hellip;</button>";
+    b += "<button id='idbtn' class='button'>Identify</button>";
+    b += "</div>";
+    b += "<div class='form-group'>";
+    b += "<label for='bslider'>Brightness <span id='bval'>&hellip;</span> / 255</label>";
+    b += "<input type='range' id='bslider' min='0' max='255' value='0'>";
+    b += "</div>";
+    return b;
+}
+
+// The script behind those controls. Split from the markup only because both
+// pages need both halves and the poller has to come after the elements exist.
+static String controlsJs() {
+    return String(
+        "function post(path,body){"
+        "return fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},"
+        "body:JSON.stringify(body||{})}).then(r=>r.json());"
+        "}"
+        // The slider fires continuously while dragging. Sending every step
+        // would queue dozens of writes to NVS behind a lamp that answers one
+        // request at a time, so it is only sent when the drag ends -- and the
+        // label tracks the thumb in the meantime so it still feels live.
+        "var slider=document.getElementById('bslider');"
+        "var dragging=false;"
+        "slider.addEventListener('input',function(){"
+        "dragging=true;document.getElementById('bval').textContent=slider.value;});"
+        "slider.addEventListener('change',function(){"
+        "dragging=false;post('/api/brightness',{value:parseInt(slider.value,10)}).then(render);});"
+        "document.getElementById('powerbtn').onclick=function(){"
+        "post('/api/power',{on:'toggle'}).then(render);};"
+        "document.getElementById('idbtn').onclick=function(){"
+        "post('/api/identify',{seconds:4}).then(render);};"
+        "function render(s){"
+        "if(!s)return;"
+        "var pb=document.getElementById('powerbtn');"
+        "pb.textContent=s.on?'Turn off':'Turn on';"
+        "pb.className='button '+(s.on?'primary':'');"
+        "document.getElementById('idbtn').disabled=!!s.identifying;"
+        // Not while dragging: overwriting the thumb under the finger makes the
+        // slider fight back.
+        "if(!dragging){slider.value=s.brightness;"
+        "document.getElementById('bval').textContent=s.brightness;}"
+        "}");
+}
+
+void LampSettings::handleHome() {
+    WebServer &server = configServer.getServer();
+    bool online = WiFi.status() == WL_CONNECTED;
+
+    String b;
+    b += "<p>A ring of 8 LEDs blending between three vibrant colors.</p>";
+
+    b += controlsHtml();
+
+    b += "<h2>Status</h2>";
+    b += "<table>";
+    b += row("Name", label);
+    b += "<tr><th>Color</th><td><span id='swatch' style='background:" + lampColorHex() +
+         "'></span><span id='color'>" + lampColorHex() + "</span></td></tr>";
+    b += rowId("State", lampPower() ? "on" : "off", "state");
+    b += "</table>";
+
+    b += "<h2>Network</h2>";
+    b += "<table>";
+    b += row("Hostname", host);
+    b += row("mDNS", String(MDNS_HOSTNAME_HINT));
+    b += row("WiFi", online ? WiFi.SSID() : String("not connected"));
+    b += row("IP", online ? WiFi.localIP().toString() : String());
+    b += rowId("Signal", online ? String(WiFi.RSSI()) + " dBm" : String(), "rssi");
+    b += "</table>";
+
+    b += "<h2>Firmware</h2>";
+    b += "<table>";
+    b += row("Running", FIRMWARE_VERSION);
+    b += rowId("Latest release", "", "latest");
+    b += "</table>";
+
+    b += "<div class='button-group'>";
+    b += "<a href='/settings' class='button'>Settings</a>";
+    b += "<a href='/help' class='button'>API</a>";
+    b += "<a href='/wifi' class='button'>WiFi Setup</a>";
+    b += "</div>";
+
+    // One poller drives the whole page. Failures are swallowed: a reboot or a
+    // dropped link should leave the last known values on screen rather than
+    // blanking the page.
+    b += "<script>";
+    b += controlsJs();
+    b += "function u(){fetch('/api/status?pretty=0',{cache:'no-store'}).then(r=>r.json()).then(s=>{"
+         "document.getElementById('color').textContent=s.color;"
+         "document.getElementById('swatch').style.background=s.color;"
+         "document.getElementById('state').textContent=s.power;"
+         "document.getElementById('rssi').textContent="
+         "s.network.online?s.network.rssi+' dBm':'\\u2014';"
+         "document.getElementById('latest').textContent=s.ota.latest?s.ota.latest:'\\u2014';"
+         "render(s);"
+         "}).catch(()=>{});}"
+         "setInterval(u,1000);u();"
+         "</script>";
+
+    server.send(200, "text/html", page("Glow Lamp", b));
+}
+
+void LampSettings::handleSettingsGet() {
+    String b;
+
+    // Firmware first: it is the thing most likely to be wanted, and it is the
+    // one control that changes what the lamp is rather than what it is doing.
+    b += "<h2>Firmware</h2>";
+    b += "<table>";
+    b += row("Running", FIRMWARE_VERSION);
+    b += rowId("Latest release", "", "latest");
+    b += "</table>";
+    b += "<div id='otabox'></div>";
+    b += "<div class='button-group'>";
+    b += "<button id='checkbtn' class='button'>Check for updates</button>";
+    b += "</div>";
+
+    b += "<hr>";
+    b += controlsHtml();
+
+    b += "<hr>";
+    b += "<form method='POST' action='/settings'>";
+    b += "<h2>Names</h2>";
+
+    b += "<div class='form-group'>";
+    b += "<label for='name'>Lamp name</label>";
+    b += "<input type='text' id='name' name='name' value='" + label + "' maxlength='32' required>";
+    b += "<small>What you call this lamp. Shown here and announced over mDNS so a "
+         "scan can tell two lamps apart. Takes effect immediately.</small>";
+    b += "</div>";
+
+    b += "<div class='form-group'>";
+    b += "<label for='hostname'>Hostname</label>";
+    b += "<input type='text' id='hostname' name='hostname' value='" + host + "' maxlength='18' required>";
+    b += "<small>Lowercase letters, digits and hyphens. Becomes <code>" + host +
+         "-&lt;mac&gt;.local</code> and the setup AP name. Needs a reboot.</small>";
+    b += "</div>";
+
+    b += "<div class='button-group'><button type='submit' class='button primary'>Save names</button></div>";
+    b += "</form>";
+
+    // Separate form: nesting it would submit the names too.
+    b += "<hr>";
+    b += "<form method='POST' action='/reboot' onsubmit='return confirm(\"Reboot the lamp?\")'>";
+    b += "<div class='button-group'>";
+    b += "<a href='/' class='button'>Home</a>";
+    b += "<a href='/help' class='button'>API</a>";
+    b += "<button type='submit' class='button danger'>Reboot</button>";
+    b += "</div></form>";
+
+    b += "<script>";
+    b += controlsJs();
+    b += "var installing=false;"
+         "function esc(t){var d=document.createElement('div');d.textContent=t;return d.innerHTML;}"
+         "function otaBox(o){"
+         "var box=document.getElementById('otabox'),btn=document.getElementById('checkbtn');"
+         "document.getElementById('latest').textContent=o.latest?o.latest:'\\u2014';"
+         "if(installing)return;"
+         "btn.disabled=(o.state=='checking');"
+         "btn.textContent=o.state=='checking'?'Checking\\u2026':'Check for updates';"
+         "if(o.state=='error'&&o.error){"
+         "box.innerHTML=\"<div class='status warning'>Check failed: \"+esc(o.error)+\"</div>\";return;}"
+         "if(o.available){"
+         "box.innerHTML=\"<div class='status warning'>Version \"+esc(o.latest)+\" is available.</div>\"+"
+         "\"<div class='button-group'><button id='upbtn' class='button primary'>Update to \"+esc(o.latest)+\"</button></div>\";"
+         "document.getElementById('upbtn').onclick=install;return;}"
+         "if(o.checked>=0){box.innerHTML=\"<div class='status success'>Up to date.</div>\";return;}"
+         "box.innerHTML='';"
+         "}"
+         "function install(){"
+         "if(!confirm('Download and install the latest firmware? The lamp reboots when it finishes.'))return;"
+         "installing=true;"
+         "document.getElementById('checkbtn').disabled=true;"
+         "document.getElementById('otabox').innerHTML="
+         "\"<div class='loading'></div><div class='status'>Downloading and installing. The lamp stops \"+"
+         "\"answering for a minute, then reboots on the new version. This page recovers on its own.</div>\";"
+         "post('/api/ota/install',{}).catch(()=>{});"
+         "setTimeout(function(){location.reload();},45000);"
+         "}"
+         "document.getElementById('checkbtn').onclick=function(){"
+         "document.getElementById('checkbtn').disabled=true;"
+         "document.getElementById('checkbtn').textContent='Checking\\u2026';"
+         "post('/api/ota/check',{}).catch(()=>{});};"
+         "function u(){fetch('/api/status?pretty=0',{cache:'no-store'}).then(r=>r.json()).then(s=>{"
+         "render(s);otaBox(s.ota);"
+         "}).catch(()=>{});}"
+         "setInterval(u,1000);u();"
+         "</script>";
+
+    configServer.getServer().send(200, "text/html", page("Settings", b));
+}
+
+void LampSettings::handleSettingsSave() {
+    WebServer &server = configServer.getServer();
+
+    String newLabel = server.hasArg("name") ? server.arg("name") : label;
+    newLabel.trim();
+    if (newLabel.length() == 0) newLabel = label;
+    if (newLabel.length() > 32) newLabel = newLabel.substring(0, 32);
+
+    String newHost = host;
+    if (server.hasArg("hostname")) {
+        String clean = sanitizeHost(server.arg("hostname"));
+        if (clean.length()) newHost = clean;
+    }
+
+    bool hostChanged = newHost != host;
+    saveNames(newLabel, newHost);
+    ESP_LOGI(TAG, "saved: label=%s host=%s", label.c_str(), host.c_str());
+
+    String b;
+    b += "<div class='status success'>Saved</div>";
+    if (hostChanged) {
+        b += "<div class='status warning'>Hostname is now <b>" + host +
+             "</b>. Reboot for it to take effect.</div>";
+        b += "<form method='POST' action='/reboot'><div class='button-group'>"
+             "<button type='submit' class='button danger'>Reboot now</button></div></form>";
+    }
+    b += "<div class='button-group'><a href='/settings' class='button primary'>Back to settings</a></div>";
+
+    server.send(200, "text/html", page("Settings", b));
 }
 
 void LampSettings::handleReboot() {
@@ -104,7 +709,7 @@ void LampSettings::handleReboot() {
          "n++;"
          "document.getElementById('msg').textContent="
          "'Rebooting, waiting for the lamp to come back... ('+n+'/'+max+')';"
-         "fetch('/status.json',{cache:'no-store'})"
+         "fetch('/api/status?pretty=0',{cache:'no-store'})"
          ".then(r=>{if(r.ok){location.href='/';}else{again();}})"
          ".catch(()=>again());"
          "}"
@@ -123,314 +728,111 @@ void LampSettings::handleReboot() {
     ESP.restart();
 }
 
-// EasyWiFi's stylesheet covers .card, .form-group, .button and text inputs, but
-// has nothing for <h2> (its own pages have no subheadings) and does not style
-// input[type=range]. Section headings and the brightness slider get rules here.
-static const char *EXTRA_CSS =
-    "<style>"
-    "h2{font-size:16px;margin:24px 0 4px;color:#333;"
-    "text-transform:uppercase;letter-spacing:.04em;}"
-    "h2:first-of-type{margin-top:8px;}"
-    "hr{border:0;border-top:1px solid #eee;margin:24px 0;}"
-    "code{background:#f0f0f0;padding:1px 4px;border-radius:4px;}"
-    "table{width:100%;border-collapse:collapse;margin:8px 0 4px;}"
-    "th,td{text-align:left;padding:8px 0;border-bottom:1px solid #eee;font-size:15px;}"
-    "th{color:#666;font-weight:500;width:40%;}"
-    "td{color:#333;}"
-    "input[type=range]{width:100%;}"
-    "#swatch{display:inline-block;width:14px;height:14px;border-radius:50%;"
-    "margin-right:8px;vertical-align:-2px;border:1px solid rgba(0,0,0,.15);}"
-    "</style>";
-
-String LampSettings::page(const String &title, const String &bodyHtml) {
-    // getHTMLHeader() already closes </head> and opens <body>, so the page only
-    // supplies the card itself.
-    String html = webPages->getHTMLHeader(title);
-    html += EXTRA_CSS;
-    html += "<div class='card'>";
-    html += "<h1>" + title + "</h1>";
-    html += bodyHtml;
-    html += "</div>";
-    html += webPages->getHTMLFooter();
-    return html;
+String LampSettings::expectedHostname() const {
+    uint8_t mac[6];
+    WiFi.macAddress(mac);
+    char buf[48];
+    snprintf(buf, sizeof(buf), "%s-%02x%02x%02x.local", host.c_str(), mac[3], mac[4], mac[5]);
+    return String(buf);
 }
 
-// Error text comes from HTTPUpdate and the TLS stack, which are free to put a
-// quote or a backslash in it. Unescaped, one of those turns status.json into a
-// parse error and the page stops updating -- a failed update would take the
-// display that reports it down with it.
-static String jsonEscape(const String &in) {
-    String out;
-    out.reserve(in.length() + 8);
-    for (unsigned i = 0; i < in.length(); i++) {
-        char c = in[i];
-        if (c == '"' || c == '\\') {
-            out += '\\';
-            out += c;
-        } else if (c == '\n' || c == '\r' || c == '\t') {
-            out += ' ';
-        } else if ((uint8_t)c < 0x20) {
-            // Anything else in the control range is dropped rather than
-            // \u-escaped; none of it is meaningful in an error message.
-        } else {
-            out += c;
-        }
-    }
-    return out;
-}
-
-// The home page renders once and would then sit stale while the ring keeps
-// blending. This is polled from that page to refresh the live fields in place.
-void LampSettings::handleStatusJson() {
+// The human- and agent-readable API reference, served by the lamp itself so it
+// travels with the firmware and cannot describe a version that is not running.
+// GET /api is the same thing as JSON.
+//
+// Everything here is literal: an agent reading this page should be able to
+// drive the lamp without guessing at a parameter name or a value format.
+void LampSettings::handleHelp() {
     WebServer &server = configServer.getServer();
-    bool online = WiFi.status() == WL_CONNECTED;
+    String base = "http://" + String(MDNS_HOSTNAME_HINT);
+    if (String(MDNS_HOSTNAME_HINT).length() == 0) base = "http://" + WiFi.localIP().toString();
 
-    String j = "{";
-    j += "\"color\":\"" + lampColorHex() + "\"";
-    j += ",\"brightness\":" + String(lampBrightness());
-    j += ",\"rssi\":" + String(online ? WiFi.RSSI() : 0);
-    j += ",\"online\":";
-    j += online ? "true" : "false";
-
-    // Firmware block: what is running, what GitHub has, and whether the two
-    // differ. find_devices.sh reads these too, so the same call serves the
-    // status page and the fleet scan.
-    j += ",\"version\":\"" FIRMWARE_VERSION "\"";
-    j += ",\"ota\":{\"state\":\"" + String(otaState()) + "\"";
-    j += ",\"latest\":\"" + otaLatestTag() + "\"";
-    j += ",\"available\":";
-    j += otaUpdateAvailable() ? "true" : "false";
-    j += ",\"checked\":" + String(otaSecondsSinceCheck());
-    j += ",\"error\":\"" + jsonEscape(otaLastError()) + "\"}";
-    j += "}";
-
-    // No-store: a cached status is worse than none, and some browsers will
-    // happily serve one back for a bare GET on a small unchanging URL.
-    server.sendHeader("Cache-Control", "no-store");
-    server.send(200, "application/json", j);
-}
-
-// One row of the status table. Kept out of handleHome() so the markup for a
-// missing value is written once.
-static String row(const String &label, const String &value) {
-    return "<tr><th>" + label + "</th><td>" + (value.length() ? value : String("&mdash;")) + "</td></tr>";
-}
-
-// Same, with an id on the value cell so the poller can rewrite it.
-static String rowId(const String &label, const String &value, const char *id) {
-    return "<tr><th>" + label + "</th><td id='" + id + "'>" +
-           (value.length() ? value : String("&mdash;")) + "</td></tr>";
-}
-
-void LampSettings::handleHome() {
-    WebServer &server = configServer.getServer();
-    bool online = WiFi.status() == WL_CONNECTED;
+    // One endpoint's entry. Written as a helper so the page and its markup stay
+    // in step as endpoints are added.
+    auto ep = [](const char *method, const char *path, const char *body, const String &what) {
+        String s = "<p class='api'><b>" + String(method) + " " + String(path) + "</b><br>" + what;
+        if (body[0]) s += "<br><code>" + String(body) + "</code>";
+        s += "</p>";
+        return s;
+    };
 
     String b;
-    b += "<p>A ring of 8 LEDs blending between three vibrant colors.</p>";
+    b += "<p>This lamp is controlled over HTTP. Every mutating call answers with the "
+         "same object <code>GET /api/status</code> returns, so the new state never needs "
+         "a second request.</p>";
 
-    b += "<h2>Lamp</h2>";
+    b += "<h2>Conventions</h2>";
+    b += "<p class='api'>Values may be sent as a JSON body, a form field, or a query "
+         "parameter &mdash; all three work on every endpoint. Anything that changes the "
+         "lamp is <b>POST</b> only, so nothing a browser can prefetch can switch a lamp "
+         "off or reflash it. There is no authentication: these lamps are LAN devices and "
+         "anything that can reach one can control it.</p>";
+
+    b += "<h2>Finding a lamp</h2>";
+    b += "<p class='api'>Lamps announce <b>_" MDNS_SERVICE "._tcp</b> over mDNS on port 80. "
+         "The TXT records carry the lamp's name, hostname and firmware version. "
+         "<code>scripts/glowlamp.py discover</code> in the project repo does this and "
+         "prints one line per lamp.</p>";
+
+    b += "<h2>Endpoints</h2>";
+    b += ep("GET", "/api", "", "This reference as JSON, including the endpoint list.");
+    b += ep("GET", "/api/status", "",
+            "Full state: name, version, power, brightness, color, network and update "
+            "status. Add <code>?pretty=0</code> for compact JSON.");
+    b += ep("POST", "/api/power", "{\"on\": true}",
+            "Switch the lamp on or off. Accepts <code>true</code>, <code>false</code> or "
+            "<code>\"toggle\"</code>; also <code>on/off</code>, <code>1/0</code>, "
+            "<code>yes/no</code>. Persists across a reboot.");
+    b += ep("POST", "/api/brightness", "{\"value\": 128}",
+            "Set brightness, 0&ndash;255. Persists. Independent of power: setting it on a "
+            "lamp that is off changes what it comes back on at.");
+    b += ep("POST", "/api/identify", "{\"seconds\": 4}",
+            "Blink white for a moment so you can tell which lamp this is. Overrides power "
+            "and restores whatever was showing, so identifying a lamp that is off leaves "
+            "it off. 1&ndash;60 seconds.");
+    b += ep("POST", "/api/name", "{\"name\": \"Living Room\", \"hostname\": \"glow-lamp\"}",
+            "Rename. <code>name</code> is free text and takes effect immediately; "
+            "<code>hostname</code> is lowercase letters, digits and hyphens, and needs a "
+            "reboot because mDNS has already published the old one.");
+    b += ep("POST", "/api/ota/check", "",
+            "Ask GitHub for the latest release. Installs nothing &mdash; read the result "
+            "from <code>ota</code> in the status a second or two later.");
+    b += ep("POST", "/api/ota/install", "",
+            "Install the latest release and reboot. The lamp answers first, then stops "
+            "responding for 10&ndash;30 s while it downloads.");
+    b += ep("POST", "/api/reboot", "", "Reboot the lamp.");
+
+    b += "<h2>Examples</h2>";
+    b += "<pre><code># what is this lamp doing\n";
+    b += "curl " + base + "/api/status\n\n";
+    b += "# off, on, and back to half brightness\n";
+    b += "curl -X POST " + base + "/api/power -d '{\"on\":false}'\n";
+    b += "curl -X POST " + base + "/api/power -d '{\"on\":true}'\n";
+    b += "curl -X POST " + base + "/api/brightness -d '{\"value\":128}'\n\n";
+    b += "# which one is this?\n";
+    b += "curl -X POST " + base + "/api/identify -d '{\"seconds\":4}'\n\n";
+    b += "# a query parameter works too, if quoting JSON is awkward\n";
+    b += "curl -X POST '" + base + "/api/power?on=toggle'</code></pre>";
+
+    b += "<h2>Status fields</h2>";
     b += "<table>";
-    b += "<tr><th>Color</th><td><span id='swatch' style='background:" + lampColorHex() +
-         "'></span><span id='color'>" + lampColorHex() + "</span></td></tr>";
-    b += rowId("Brightness", String(lampBrightness()) + " / 255", "bright");
+    b += row("name", "What this lamp is called.");
+    b += row("hostname", "The mDNS label; the lamp answers at <code>&lt;hostname&gt;-&lt;mac&gt;.local</code>.");
+    b += row("version", "Firmware version, matching a GitHub release tag.");
+    b += row("on / power", "Boolean and the same thing as <code>\"on\"</code> or <code>\"off\"</code>.");
+    b += row("brightness", "0&ndash;255, what it shows at when on.");
+    b += row("color", "The color the ring is on right now, <code>#rrggbb</code>.");
+    b += row("identifying", "True while the identify flash is running.");
+    b += row("network", "online, ssid, ip, rssi, mac.");
+    b += row("ota", "state, latest, available, checked (seconds ago, -1 if never), error.");
+    b += row("uptime", "Seconds since boot.");
     b += "</table>";
 
-    b += "<h2>Network</h2>";
-    b += "<table>";
-    b += row("Hostname", name);
-    b += row("mDNS", String(MDNS_HOSTNAME_HINT));
-    b += row("WiFi", online ? WiFi.SSID() : String("not connected"));
-    b += row("IP", online ? WiFi.localIP().toString() : String());
-    b += rowId("Signal", online ? String(WiFi.RSSI()) + " dBm" : String(), "rssi");
-    b += "</table>";
-
-    b += "<h2>Firmware</h2>";
-    b += "<table>";
-    b += row("Running", FIRMWARE_VERSION);
-    b += rowId("Latest release", "", "latest");
-    b += "</table>";
-
-    // Filled in by the poller: the check result, and the update button when
-    // there is something to take. Rendered empty rather than server-side,
-    // because a check started from this page lands a second or two after the
-    // page itself does.
-    b += "<div id='otabox'></div>";
-    b += "<div class='button-group'>";
-    b += "<button id='checkbtn' class='button'>Check for updates</button>";
-    b += "</div>";
-
-    b += "<div class='button-group'>";
-    b += "<a href='/settings' class='button'>Settings</a>";
-    b += "<a href='/wifi' class='button'>WiFi Setup</a>";
-    b += "</div>";
-
-    // Poll once a second so the color swatch tracks the ring. Failures are
-    // swallowed: a reboot or a dropped link should leave the last known values
-    // on screen rather than blanking the page.
-    // One poller drives the whole page. Failures are swallowed: a reboot or a
-    // dropped link should leave the last known values on screen rather than
-    // blanking the page -- and during an install the lamp stops answering
-    // entirely, which is exactly when the last message on screen matters most.
-    b += "<script>"
-         "var installing=false;"
-         "function esc(t){var d=document.createElement('div');d.textContent=t;return d.innerHTML;}"
-         "function otaBox(s){"
-         "var o=s.ota,b=document.getElementById('otabox'),btn=document.getElementById('checkbtn');"
-         "document.getElementById('latest').textContent=o.latest?o.latest:'\\u2014';"
-         "if(installing){return;}"
-         "btn.disabled=(o.state=='checking');"
-         "btn.textContent=o.state=='checking'?'Checking\\u2026':'Check for updates';"
-         "if(o.state=='error'&&o.error){"
-         "b.innerHTML=\"<div class='status warning'>Check failed: \"+esc(o.error)+\"</div>\";return;}"
-         "if(o.available){"
-         "b.innerHTML=\"<div class='status warning'>Version \"+esc(o.latest)+\" is available.</div>\"+"
-         "\"<div class='button-group'><button id='upbtn' class='button primary'>Update to \"+esc(o.latest)+\"</button></div>\";"
-         "document.getElementById('upbtn').onclick=install;return;}"
-         "if(o.checked>=0){b.innerHTML=\"<div class='status success'>Up to date.</div>\";return;}"
-         "b.innerHTML='';"
-         "}"
-         "function install(){"
-         "if(!confirm('Download and install the latest firmware? The lamp reboots when it finishes.'))return;"
-         "installing=true;"
-         "document.getElementById('checkbtn').disabled=true;"
-         "document.getElementById('otabox').innerHTML="
-         "\"<div class='loading'></div><div class='status'>Downloading and installing. The lamp stops \"+"
-         "\"answering for a minute, then reboots on the new version. This page recovers on its own.</div>\";"
-         "fetch('/ota/install',{method:'POST'}).catch(()=>{});"
-         "setTimeout(function(){location.reload();},45000);"
-         "}"
-         "function u(){fetch('/status.json',{cache:'no-store'}).then(r=>r.json()).then(s=>{"
-         "document.getElementById('color').textContent=s.color;"
-         "document.getElementById('swatch').style.background=s.color;"
-         "document.getElementById('bright').textContent=s.brightness+' / 255';"
-         "document.getElementById('rssi').textContent=s.online?s.rssi+' dBm':'\\u2014';"
-         "otaBox(s);"
-         "}).catch(()=>{});}"
-         "document.getElementById('checkbtn').onclick=function(){"
-         "document.getElementById('checkbtn').disabled=true;"
-         "document.getElementById('checkbtn').textContent='Checking\\u2026';"
-         "fetch('/ota/check',{method:'POST'}).catch(()=>{});};"
-         "setInterval(u,1000);u();"
-         "</script>";
-
-    server.send(200, "text/html", page("Glow Lamp", b));
-}
-
-void LampSettings::handleGet() {
-    WebServer &server = configServer.getServer();
-
-    String b;
-    b += "<form method='POST' action='/settings'>";
-
-    b += "<h2>Device</h2>";
-    b += "<div class='form-group'>";
-    b += "<label for='name'>Hostname</label>";
-    b += "<input type='text' id='name' name='name' value='" + name + "' maxlength='18' required>";
-    b += "<small>Lowercase letters, digits and hyphens. Becomes <code>" + name +
-         "-&lt;mac&gt;.local</code> and the setup AP name. Takes effect after a reboot.</small>";
-    b += "</div>";
-
-    b += "<h2>Lamp</h2>";
-    b += "<div class='form-group'>";
-    b += "<label for='bright'>Brightness <span id='brightval'>" + String(bright) + "</span> / 255</label>";
-    b += "<input type='range' id='bright' name='bright' min='1' max='255' value='" + String(bright) + "'>";
-    b += "<small>Applies on save. The 500 mA cap in firmware limits what the top "
-         "of the range actually draws.</small>";
-    b += "</div>";
-
-    b += "<div class='button-group'><button type='submit' class='button primary'>Save</button></div>";
-    b += "</form>";
-
-    // Separate form: nesting it would submit the settings too.
-    b += "<hr>";
-    b += "<h2>Firmware</h2>";
-    b += "<p>Running <code>" FIRMWARE_VERSION "</code>. The lamp checks GitHub once a "
-         "day on its own; the <a href='/'>status page</a> checks on demand and offers "
-         "the update when there is one.</p>";
-
-    b += "<hr>";
-    b += "<form method='POST' action='/reboot' onsubmit='return confirm(\"Reboot the lamp?\")'>";
     b += "<div class='button-group'>";
     b += "<a href='/' class='button'>Home</a>";
-    b += "<button type='submit' class='button danger'>Reboot</button>";
-    b += "</div></form>";
+    b += "<a href='/settings' class='button'>Settings</a>";
+    b += "<a href='/api' class='button'>/api as JSON</a>";
+    b += "</div>";
 
-    b += "<script>"
-         "var r=document.getElementById('bright'),o=document.getElementById('brightval');"
-         "r.addEventListener('input',function(){o.textContent=r.value;});"
-         "</script>";
-
-    server.send(200, "text/html", page("Settings", b));
-}
-
-void LampSettings::handleSave() {
-    WebServer &server = configServer.getServer();
-
-    bool nameChanged = false;
-    if (server.hasArg("name")) {
-        String clean = sanitizeName(server.arg("name"));
-        if (clean.length() && clean != name) {
-            name = clean;
-            nameChanged = true;
-        }
-    }
-    if (server.hasArg("bright")) {
-        long v = server.arg("bright").toInt();
-        if (v >= 1 && v <= 255) bright = (uint8_t)v;
-    }
-
-    Preferences p;
-    p.begin(NVS_NS, false);
-    p.putString("name", name);
-    p.putUChar("bright", bright);
-    p.end();
-
-    // Apply immediately rather than at the next boot -- the point of a slider is
-    // seeing the result.
-    setLampBrightness(bright);
-    ESP_LOGI(TAG, "saved: name=%s brightness=%u", name.c_str(), bright);
-
-    String b;
-    b += "<div class='status success'>Saved</div>";
-    if (nameChanged) {
-        b += "<div class='status warning'>Hostname is now <b>" + name +
-             "</b>. Reboot for it to take effect.</div>";
-        b += "<form method='POST' action='/reboot'><div class='button-group'>"
-             "<button type='submit' class='button danger'>Reboot now</button></div></form>";
-    }
-    b += "<div class='button-group'><a href='/settings' class='button primary'>Back to settings</a></div>";
-
-    server.send(200, "text/html", page("Settings", b));
-}
-
-// Both handlers queue and return immediately. The work happens in loopOta() on
-// the next pass -- see ota.h for why neither can run inside a request handler.
-//
-// They answer JSON rather than a page, so the same endpoints serve the status
-// page's fetch() and a curl from a script. The body is the state at the moment
-// the request was queued, not the outcome; the caller polls /status.json for
-// that.
-
-void LampSettings::handleOtaCheck() {
-    WebServer &server = configServer.getServer();
-    ESP_LOGI(TAG, "update check requested over HTTP");
-    requestOtaCheck();
-
-    server.sendHeader("Cache-Control", "no-store");
-    server.send(200, "application/json",
-                "{\"queued\":\"check\",\"version\":\"" FIRMWARE_VERSION "\"}");
-}
-
-void LampSettings::handleOtaInstall() {
-    WebServer &server = configServer.getServer();
-    ESP_LOGI(TAG, "update install requested over HTTP (running %s, latest %s)", FIRMWARE_VERSION,
-             otaLatestTag().length() ? otaLatestTag().c_str() : "unknown");
-    requestOtaInstall();
-
-    // Answered before the download starts, because once it does this device
-    // stops serving anything until it reboots.
-    server.sendHeader("Cache-Control", "no-store");
-    server.send(200, "application/json",
-                "{\"queued\":\"install\",\"version\":\"" FIRMWARE_VERSION "\"}");
+    server.send(200, "text/html", page("REST API", b));
 }

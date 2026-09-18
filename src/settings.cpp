@@ -492,7 +492,8 @@ void LampSettings::handleApiEffects() {
         "Walks the palette steadily, never resting on a color.",
         "Similar colors mixing and guttering, like a flame. The one effect that "
         "lights the ring several colors at once.",
-        "One color, steady, with the stutter of a failing neon tube.",
+        "One color, bright and steady, with an occasional brief flicker. Colors "
+        "cross-fade.",
     };
     for (uint8_t i = 0; i < EFFECT_COUNT; i++) {
         JsonObject e = list.add<JsonObject>();
@@ -910,7 +911,7 @@ void LampSettings::handleEffectsPage() {
         "holds a color, eases to the next",
         "walks the palette, never resting",
         "mixes similar colors, like a flame",
-        "steady, with the stutter of a failing tube",
+        "bright and steady, flickers now and then",
     };
     b += "<div id='fxbuttons'>";
     for (uint8_t i = 0; i < EFFECT_COUNT; i++) {

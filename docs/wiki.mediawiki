@@ -108,7 +108,7 @@ restores whatever was showing, so identifying a lamp that is off leaves it off.
 |-
 | <code>flicker</code> || Similar colors mixing and guttering, like a flame. The one effect that lights the ring several colors at once.
 |-
-| <code>neon</code> || One color, steady, with the stutter of a failing neon tube.
+| <code>neon</code> || One color, bright and steady, with an occasional brief flicker. Colors cross-fade.
 |}
 
 Set from <code>http://<lamp>/effects</code>, which carries one-tap presets (Flame,
@@ -214,17 +214,144 @@ OTA.
 
 == Home Assistant automations ==
 
-''To be filled in.''
+Point a lamp at the broker and its entity appears on its own. Nothing is added to
+<code>configuration.yaml</code>, nothing is restarted, and Home Assistant needs no
+filesystem access &mdash; which is the whole reason the lamps speak MQTT. See
+<code>docs/home-assistant-control.md</code> for why REST was rejected for this.
 
-<!--
-Reserved for the Home Assistant side: entity names, the automations that use
-them, scenes, dashboards, and how the lamps fit the wider house-off routine.
+=== Entities ===
 
-Reference material already in the repo:
-  docs/home-assistant.md          configuration, REST and shell_command fallbacks
-  docs/home-assistant-control.md  why MQTT rather than REST from Home Assistant
-  docs/mqtt.md                    the topics and payloads these automations drive
--->
+{| class="wikitable"
+! Lamp !! Entity !! Supports
+|-
+| Castor || <code>light.castor</code> || on/off, brightness, color, effect
+|-
+| Pollux || <code>light.pollux</code> || on/off, brightness, color, effect
+|}
+
+These are ordinary light entities. They work in automations, scenes, dashboards
+and voice like any other light, and they report state back &mdash; a lamp changed
+from its own web page shows the new state in Home Assistant within a second.
+
+'''Check the entity ID before writing anything against it.''' Home Assistant builds
+it from the device name and the entity name, so a lamp that publishes both as
+"Castor" becomes <code>light.castor_castor</code>, named "Castor Castor". Firmware that
+publishes a null entity name gets the clean <code>light.castor</code>. Both lamps were
+doubled on first connect under 0.0.5.
+
+=== The schedule ===
+
+The lamps follow the GlowKitchen strips, so the workshop lights behave as one.
+
+{| class="wikitable"
+! Automation !! Trigger !! Action
+|-
+| GlowLamp on at 9am || 09:00 || <code>light.turn_on</code>
+|-
+| GlowLamp brightness 100% at sunset || sunset || <code>light.turn_on</code>, brightness 255
+|-
+| GlowLamp brightness 50% at 11pm || 23:00 || <code>light.turn_on</code>, brightness 128
+|-
+| GlowLamp off at 12:30am || 00:30 || <code>light.turn_off</code>
+|}
+
+9am rather than sunset-minus-an-hour: the interior stays dark well into the
+morning. 12:30am rather than midnight: a midnight OFF would blank everything at
+the exact moment the New Year effect fires.
+
+<syntaxhighlight lang="yaml">
+- id: glowlamp_on_at_0900
+  alias: GlowLamp on at 9am
+  triggers:
+    - trigger: time
+      at: "09:00:00"
+  actions:
+    - action: light.turn_on
+      target:
+        entity_id: [light.castor, light.pollux]
+  mode: single
+
+- id: glowlamp_off_at_0030
+  alias: GlowLamp off at 12:30am
+  triggers:
+    - trigger: time
+      at: "00:30:00"
+  actions:
+    - action: light.turn_off
+      target:
+        entity_id: [light.castor, light.pollux]
+  mode: single
+</syntaxhighlight>
+
+Brightness is 0&ndash;255, so 255 is 100% and 128 is 50%. The lamp persists both
+power and brightness, so the morning ON does not need to set a brightness: it
+comes back at whatever the 11pm automation last left.
+
+=== Brightness and power arrive together ===
+
+The JSON light schema carries <code>state</code> and <code>brightness</code> in one
+message, so '''<code>light.turn_on</code> with a brightness switches the lamp on''' whether
+or not that was the intent. An unconditional brightness automation will undo
+someone deliberately switching a lamp off.
+
+The two brightness automations are therefore conditioned on the lamp already
+being on:
+
+<syntaxhighlight lang="yaml">
+  conditions:
+    - condition: state
+      entity_id: [light.castor, light.pollux]
+      state: "on"
+      match: any
+</syntaxhighlight>
+
+The GlowKitchen equivalents need no such condition, because
+<code>SET_BRIGHTNESS</code> on those strips does not touch power. This is the one
+place the two fleets genuinely differ.
+
+=== Fitting the house-off routine ===
+
+Because the lamps are real entities, house-wide automations pick them up for
+free &mdash; an "everything off" routine that targets lights, an area or a group
+reaches Castor and Pollux with nothing added.
+
+The GlowKitchen strips cannot do this. They publish no discovery config, so they
+are not entities, and every automation that touches them publishes to
+<code>lights/all/cmd</code> by hand. Any new automation meant to cover the whole
+workshop has to do both:
+
+<syntaxhighlight lang="yaml">
+  actions:
+    - action: light.turn_off
+      target:
+        entity_id: [light.castor, light.pollux]
+    - action: mqtt.publish
+      data:
+        topic: lights/all/cmd
+        payload: "OFF"
+        retain: false
+</syntaxhighlight>
+
+'''Never retain a command.''' A retained command replays on every device reconnect;
+stale retained brightness messages pinning the whole fleet is a bug the
+GlowKitchen strips have already been through.
+
+=== Adding a lamp ===
+
+Set its broker and it appears. Then add its entity to each automation's
+<code>entity_id</code> list &mdash; or make a light group and target the group, which
+makes the third lamp free. The GlowKitchen <code>--all</code> equivalent does not
+exist here, because there is no script in the path: Home Assistant is talking to
+entities.
+
+=== What MQTT does not cover ===
+
+'''Firmware updates.''' <code>/api/ota/update</code> is REST only, so an overnight update
+automation needs a <code>rest_command</code> or <code>shell_command</code> block in
+<code>configuration.yaml</code> and the filesystem access that implies. Usually not
+worth it: each lamp already checks daily at 15:00 on its own. Drive it from Home
+Assistant only when the ''timing'' matters &mdash; picking the hour, and the same
+hour for every lamp.
 
 == Firmware updates ==
 

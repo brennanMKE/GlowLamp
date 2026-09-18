@@ -85,7 +85,7 @@ curl -X POST http://lamp.local/api/effect/reset
 | `blend` | The whole ring holds one color and eases to the next. The default. |
 | `loop` | Walks the palette steadily, never resting on a color. |
 | `flicker` | Similar colors mixing and guttering, like a flame. |
-| `neon` | One color, steady, with the stutter of a failing neon tube. |
+| `neon` | One color, bright and steady, with an occasional brief flicker. |
 
 **The ring shows one color at a time.** It is one light behind a diffuser, not
 eight addressable pixels: several colors an inch apart mix into white. So

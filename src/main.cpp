@@ -54,6 +54,12 @@ static const uint32_t BLEND_MS = 6000;
 // "moving".
 static const uint32_t LOOP_LEG_MS = 2500;
 
+// Neon holds a color, then cross-fades into the next over the tail of the leg.
+// The fade is quick relative to the hold: a tube changing color is a thing that
+// happens, not a thing you watch happen.
+static const uint32_t NEON_LEG_MS = 7000;
+static const uint32_t NEON_FADE_MS = 900;
+
 // ~60 fps. Faster buys nothing visible and each show() disables interrupts for
 // roughly 30 us per LED.
 static const uint32_t FRAME_MS = 16;
@@ -258,7 +264,8 @@ static void loopLeds() {
             renderFlicker(fx, now);
             break;
         case EFFECT_NEON:
-            renderNeon(fx, now);
+            fx.phase %= NEON_LEG_MS * fx.colorCount;
+            renderNeon(fx, now, NEON_LEG_MS, NEON_FADE_MS);
             break;
         case EFFECT_BLEND:
         default:

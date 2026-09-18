@@ -3,11 +3,33 @@
 
 // The four renderers, and the palette they draw with.
 //
-// Adapted from GlowKitchen's effect engine for a ring of 8. Its strip-shaped
-// effects -- chase, scan, wipe, rain -- all say "this end, then that end",
-// which a ring has nothing to say with: a run that travels along 240 LEDs
-// simply goes round and round on 8. What survives is what reads as well in a
-// circle as in a line, plus one effect that is better in a circle.
+// Adapted from GlowKitchen's effect engine for a ring of 8 behind a diffuser.
+//
+// ===== The ring shows ONE color at a time =====
+//
+// This is the constraint the whole file is built around, and it rules out more
+// than it first appears. GlowKitchen's strip effects -- chase, scan, wipe,
+// rain -- are all "this end, then that end", which needs a run of LEDs long
+// enough to see a position along it. But so does any effect that lays a
+// palette out by position: on 8 diffused LEDs, five colors an inch apart do
+// not read as five colors, they mix into a muddy white, which is the one thing
+// this lamp must never look like.
+//
+// So blend, loop and neon paint all 8 LEDs the same color on every frame, and
+// differ in how that one color moves over TIME -- how it changes, how fast,
+// and how its brightness behaves -- not in where it sits in space.
+//
+// FLICKER is the deliberate exception, and it works for the same reason the
+// others do not. Mixing is exactly what a flame is: give it a few colors that
+// are already close together -- reds and ambers -- and the LEDs blurring into
+// each other at different brightnesses reads as fire rather than as mud. The
+// mixing is the effect. Hand it five colors from opposite sides of the wheel
+// and it will go white, which is the user's call to make.
+//
+// An earlier version of this file got this wrong twice: `loop` wrapped the
+// palette around the ring as a rotating gradient, and `neon` gave each LED its
+// own color. Both are good effects on a bare 240-LED strip and both are white
+// smudges on this lamp.
 //
 // GlowKitchen's version of this header deliberately does not include
 // <FastLED.h>, so its renderers can be compiled against a stub and diffed
@@ -42,16 +64,20 @@
 // out by position.
 #define MAX_COLORS 5
 
+// Sized for the 8-LED ring with room to spare, so flicker's per-LED timers do
+// not have to be resized alongside a bigger ring.
+#define MAX_LEDS 16
+
 struct PaletteColor {
     uint8_t h;
     uint8_t s;
 };
 
 enum EffectMode {
-    EFFECT_BLEND = 0,    // the whole ring, one color, easing between palette entries
-    EFFECT_LOOP = 1,     // the palette wrapped around the ring, rotating
-    EFFECT_FLICKER = 2,  // one color, per-LED flicker, like a candle
-    EFFECT_NEON = 3,     // a color per LED, each failing on its own schedule
+    EFFECT_BLEND = 0,    // holds on a color, eases to the next
+    EFFECT_LOOP = 1,     // walks the palette steadily, never resting
+    EFFECT_FLICKER = 2,  // several similar colors mixing, guttering like a flame
+    EFFECT_NEON = 3,     // one color, steady, with the stutter of a failing tube
     EFFECT_COUNT = 4
 };
 
@@ -73,11 +99,17 @@ struct EffectState {
     // because the wrap point is not a multiple of the cycle.
     uint32_t phase = 0;
 
-    // FLICKER and NEON: when each LED next picks a new brightness, and which
-    // palette entry FLICKER is currently on.
-    uint32_t timeouts[16];
+    // When the ring (or, for flicker, each LED) next changes brightness, what
+    // that brightness is, and which palette entry is showing. Flicker runs a
+    // timer per LED because its LEDs are deliberately out of step; neon uses
+    // timeouts[0] alone, for the whole ring.
+    uint32_t timeouts[MAX_LEDS];
     uint32_t hueTimeout = 0;
     uint8_t hueIndex = 0;
+    uint8_t value = 255;
+
+    // NEON only: how many hard on/off blips are left in the current burst.
+    uint8_t blinks = 0;
 };
 
 // ===== Shared helpers =====
@@ -119,76 +151,87 @@ inline void renderBlend(EffectState &s, uint32_t blendMs) {
 
 // ===== LOOP =====
 //
-// The palette laid out around the ring and rotated, so the colors chase each
-// other around the circle. This is the effect a ring earns that a strip does
-// not: on a strip the two ends never meet and the gradient has a visible seam,
-// while on a ring the last color blends back into the first and the seam is
-// simply gone.
-//
-// Position is carried in 1/256ths of a palette step so the rotation is smooth
-// at 8 LEDs; whole-LED steps would make it jump one eighth of a turn at a time.
-inline void renderLoop(EffectState &s, uint32_t revolutionMs) {
-    // How far around the palette one full revolution has travelled, 0..65535.
-    uint32_t turn = ((uint64_t)s.phase % revolutionMs) * 65536ULL / revolutionMs;
+// The same palette as blend, walked at a steady rate and never resting. Blend
+// eases, so it spends most of its time sitting on a palette color; loop is
+// always mid-transition, so the ring is never quite the color you would name.
+// That is the whole difference between them, and on a single-color lamp it is
+// the only difference available: no easing, and a shorter leg.
+inline void renderLoop(EffectState &s, uint32_t legMs) {
+    uint8_t from = (s.phase / legMs) % s.colorCount;
+    uint8_t to = (uint8_t)((from + 1) % s.colorCount);
 
-    for (uint8_t i = 0; i < s.numLeds; i++) {
-        // Where this LED sits in palette space, in 1/256ths of a step.
-        uint32_t pos = ((uint32_t)i * s.colorCount * 256) / s.numLeds;
-        pos = (pos + (turn * s.colorCount / 256)) % ((uint32_t)s.colorCount * 256);
+    // Linear, deliberately. ease8InOutCubic() here would make this blend.
+    uint8_t frac = (uint8_t)(((s.phase % legMs) * 255UL) / legMs);
 
-        uint8_t index = (uint8_t)(pos / 256);
-        uint8_t frac = (uint8_t)(pos % 256);
-        uint8_t next = (uint8_t)((index + 1) % s.colorCount);
-
-        s.leds[i] = blendColor(s.colors[index], s.colors[next], frac);
-    }
+    CHSV color = blendColor(s.colors[from], s.colors[to], frac);
+    for (uint8_t i = 0; i < s.numLeds; i++) s.leds[i] = color;
 }
 
 // ===== FLICKER =====
 //
-// One palette color across the ring, each LED dipping and recovering on its
-// own schedule, the color changing every few seconds. A candle, and on a ring
-// the unevenness reads as a flame rather than as a fault.
+// A flame. Each LED carries its own palette color and its own brightness, and
+// picks a new brightness every 80-220 ms on its own schedule; the assignment
+// drifts around the ring every second and a half, so no LED stays the one that
+// is always red.
 //
-// Each LED holds its brightness for 500-750 ms, so the ring settles instead of
-// buzzing; the floor of 120 keeps it alight through every dip.
+// This is the one renderer that lights the ring several colors at once, and it
+// is built to be given similar ones. The unevenness IS the flame: LEDs in
+// lockstep read as a lamp being dimmed, not as something burning.
 inline void renderFlicker(EffectState &s, uint32_t now) {
     for (uint8_t i = 0; i < s.numLeds; i++) {
         // timeReached() rather than a plain compare: an absolute deadline test
         // strands the LED for 49.7 days if the loop blocks across the rollover.
         if (timeReached(now, s.timeouts[i])) {
-            s.timeouts[i] = now + random16(500, 750);
-            uint8_t value = (uint8_t)random16(120, 255);
-            s.leds[i] = CHSV(s.colors[s.hueIndex].h, s.colors[s.hueIndex].s, value);
+            s.timeouts[i] = now + random16(80, 220);
+            const PaletteColor &c = s.colors[(i + s.hueIndex) % s.colorCount];
+            s.leds[i] = CHSV(c.h, c.s, (uint8_t)random16(130, 255));
         }
     }
 
+    // Drifts which LED shows which color, so the ring does not settle into a
+    // fixed pattern of stripes.
     if (timeReached(now, s.hueTimeout)) {
-        s.hueTimeout = now + 3000;
+        s.hueTimeout = now + 1500;
         s.hueIndex = (uint8_t)((s.hueIndex + 1) % s.colorCount);
     }
 }
 
 // ===== NEON =====
 //
-// FLICKER, except the palette is laid out by position instead of applied to
-// the whole ring at once. That single difference is the mode: a neon sign has
-// its blue tube and its red tube lit at the same time, in different places,
-// each failing on its own schedule.
+// One color, held steady, with the stutter of a tube that is not striking
+// cleanly: long calm stretches broken by a burst of hard on/off blips, then
+// calm again.
 //
-// GlowKitchen gives each color a run of LEDs, because on a long diffused strip
-// four colors one LED apart read as white. A bare ring of 8 has the opposite
-// problem -- runs would leave a 5-color palette with one LED each anyway -- so
-// colors go one per LED here and the ring reads as distinct points of light.
+// GlowKitchen's neon puts a different color on each part of the strip, which
+// is what a real sign looks like -- several tubes, lit at once, failing
+// independently. A ring of 8 cannot show several tubes, so this shows one, and
+// takes the other half of what makes neon read as neon: the failure. Flicker
+// gutters continuously and never goes out; this one is either fully lit or
+// fully dark, which is what a gas tube actually does.
+//
+// The color changes with each burst rather than on a timer, so a new color
+// arrives with the restrike.
 inline void renderNeon(EffectState &s, uint32_t now) {
-    for (uint8_t i = 0; i < s.numLeds; i++) {
-        if (timeReached(now, s.timeouts[i])) {
-            s.timeouts[i] = now + random16(500, 750);
-            uint8_t value = (uint8_t)random16(120, 255);
-            const PaletteColor &c = s.colors[i % s.colorCount];
-            s.leds[i] = CHSV(c.h, c.s, value);
+    if (timeReached(now, s.timeouts[0])) {
+        if (s.blinks > 0) {
+            // Mid-burst: alternate hard on and hard off.
+            s.blinks--;
+            s.value = s.value > 0 ? 0 : 255;
+            s.timeouts[0] = now + random16(40, 110);
+            // Leaving the burst on a dark frame would end the effect with the
+            // tube out until the next burst, which is a fault, not a flicker.
+            if (s.blinks == 0) s.value = 255;
+        } else {
+            // Calm stretch, then a new burst on a new color.
+            s.value = 255;
+            s.timeouts[0] = now + random16(1500, 5000);
+            s.blinks = (uint8_t)random16(3, 9);
+            s.hueIndex = (uint8_t)((s.hueIndex + 1) % s.colorCount);
         }
     }
+
+    CHSV color(s.colors[s.hueIndex].h, s.colors[s.hueIndex].s, s.value);
+    for (uint8_t i = 0; i < s.numLeds; i++) s.leds[i] = color;
 }
 
 #endif  // EFFECTS_H

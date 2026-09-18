@@ -5,6 +5,7 @@
 #include "every_n_millis.h"
 #include "effects.h"
 #include "lamp.h"
+#include "mqtt.h"
 #include "ota.h"
 #include "settings.h"
 #include "version.h"
@@ -13,8 +14,10 @@
 static const char *TAG = "LAMP";
 
 // ===== Ring layout =====
-// One ring of 8 WS2812B LEDs. Which LED shows which color is up to the effect;
-// blend and flicker light the whole ring the same, loop and neon do not.
+// One ring of 8 WS2812B LEDs. The ring is one light, not eight pixels: behind a
+// diffuser, several colors an inch apart mix into white, so blend, loop and
+// neon all light it a single color at a time. Flicker is the exception, and
+// relies on that mixing to look like a flame. See the header of effects.h.
 #define DATA_PIN 4
 #define NUM_LEDS 8
 
@@ -46,8 +49,10 @@ static const uint8_t DEFAULT_PALETTE_SIZE =
 // much faster and it reads as an effect.
 static const uint32_t BLEND_MS = 6000;
 
-// One full revolution of the loop effect.
-static const uint32_t LOOP_MS = 8000;
+// One leg of the loop effect -- shorter than a blend leg, because loop never
+// pauses on a color and a slow constant drift reads as "stuck" rather than
+// "moving".
+static const uint32_t LOOP_LEG_MS = 2500;
 
 // ~60 fps. Faster buys nothing visible and each show() disables interrupts for
 // roughly 30 us per LED.
@@ -86,6 +91,13 @@ static uint8_t effectRgbCount = 0;
 static bool effectIsDefault = true;
 static bool effectHasExpiry = false;
 static uint32_t effectExpiresAt = 0;
+
+// The last thing someone chose, kept apart from what is rendering. Reverting
+// to the default changes the lamp, not the choice -- otherwise "back to
+// default" would quietly throw away a palette that took a minute to pick.
+static uint8_t selectedMode = EFFECT_BLEND;
+static uint32_t selectedRgb[MAX_COLORS];
+static uint8_t selectedCount = 0;
 
 uint8_t lampBrightness() { return brightness; }
 bool lampPower() { return power; }
@@ -127,6 +139,8 @@ static void applyPalette(const PaletteColor *colors, uint8_t count) {
     for (uint8_t i = 0; i < NUM_LEDS; i++) fx.timeouts[i] = now;
     fx.hueTimeout = now + 3000;
     fx.hueIndex = 0;
+    fx.value = 255;
+    fx.blinks = 0;
 }
 
 void resetLampEffect() {
@@ -139,6 +153,15 @@ void resetLampEffect() {
         effectRgb[i] = ((uint32_t)rgb.r << 16) | ((uint32_t)rgb.g << 8) | rgb.b;
     }
     effectRgbCount = DEFAULT_PALETTE_SIZE;
+
+    // Only seeds the selection when nothing has been chosen yet -- at boot.
+    // A reset after that leaves the stored choice untouched, which is the
+    // whole point of keeping the two apart.
+    if (selectedCount == 0) {
+        for (uint8_t i = 0; i < DEFAULT_PALETTE_SIZE; i++) selectedRgb[i] = effectRgb[i];
+        selectedCount = DEFAULT_PALETTE_SIZE;
+        selectedMode = EFFECT_BLEND;
+    }
 
     effectIsDefault = true;
     effectHasExpiry = false;
@@ -167,6 +190,11 @@ bool setLampEffect(uint8_t mode, const uint32_t *colors, uint8_t count, uint32_t
     effectRgbCount = count;
     applyPalette(palette, count);
 
+    // Remember it as the choice, so a later reset can be undone by eye.
+    selectedMode = mode;
+    selectedCount = count;
+    for (uint8_t i = 0; i < count; i++) selectedRgb[i] = colors[i];
+
     effectIsDefault = false;
     effectHasExpiry = seconds > 0;
     effectExpiresAt = millis() + seconds * 1000UL;
@@ -174,6 +202,13 @@ bool setLampEffect(uint8_t mode, const uint32_t *colors, uint8_t count, uint32_t
     ESP_LOGI(TAG, "effect %s, %u colors, expires in %lus", EFFECT_NAMES[mode], count,
              (unsigned long)seconds);
     return true;
+}
+
+const char *lampSelectedName() { return EFFECT_NAMES[selectedMode]; }
+
+uint8_t lampSelectedColors(uint32_t *out) {
+    for (uint8_t i = 0; i < selectedCount; i++) out[i] = selectedRgb[i];
+    return selectedCount;
 }
 
 uint8_t lampEffectColors(uint32_t *out) {
@@ -216,8 +251,8 @@ static void loopLeds() {
     // effect would have been on rather than restarting it.
     switch (effectMode) {
         case EFFECT_LOOP:
-            fx.phase %= LOOP_MS;
-            renderLoop(fx, LOOP_MS);
+            fx.phase %= LOOP_LEG_MS * fx.colorCount;
+            renderLoop(fx, LOOP_LEG_MS);
             break;
         case EFFECT_FLICKER:
             renderFlicker(fx, now);
@@ -277,11 +312,13 @@ void setup() {
     setupWifiLink();
     setLampBrightness(settings.brightness());
     setLampPower(settings.power());
+    setupMqtt();
 }
 
 void loop() {
     loopWifiLink();
     loopOta();
+    loopMqtt();
 
     loopLeds();
 }

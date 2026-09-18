@@ -161,6 +161,18 @@ class Lamp:
     def reset_effect(self) -> dict:
         return self._request("POST", "/api/effect/reset")
 
+    def set_broker(self, host: str, port: int = 1883, user: str = "",
+                   password: str = "") -> dict:
+        """Point the lamp at an MQTT broker; an empty host turns MQTT off.
+
+        An empty password leaves the stored one alone, so the host can be
+        changed without knowing it.
+        """
+        body = {"host": host, "port": port, "user": user}
+        if password:
+            body["pass"] = password
+        return self._request("POST", "/api/broker", body)
+
     def rename(self, name: str | None = None, hostname: str | None = None) -> dict:
         body = {}
         if name is not None:
@@ -376,6 +388,7 @@ def _targets(args) -> list[Lamp]:
 def _describe(status: dict) -> str:
     name = status.get("name") or status.get("hostname", "?")
     ota = status.get("ota", {})
+    mq = status.get("mqtt", {})
     fx = status.get("effect", {})
     effect = fx.get("name", "?")
     if fx and not fx.get("default", True):
@@ -388,6 +401,8 @@ def _describe(status: dict) -> str:
         f"{effect:<12}",
         f"v{status.get('version', '?')}",
     ]
+    if mq.get("enabled"):
+        bits.append("mqtt" if mq.get("connected") else "mqtt!")
     if ota.get("available"):
         bits.append(f"-> v{ota.get('latest')} available")
     return "  ".join(bits)
@@ -433,6 +448,11 @@ def main(argv=None) -> int:
     p_fx.add_argument("--seconds", type=int, default=300,
                       help="revert after this long; 0 = until reboot (default 300)")
     add("effects", "list the effects a lamp supports")
+    p_broker = add("broker", "set the MQTT broker (empty host turns MQTT off)")
+    p_broker.add_argument("host", help="broker address, or '' to disable MQTT")
+    p_broker.add_argument("--port", type=int, default=1883)
+    p_broker.add_argument("--user", default="")
+    p_broker.add_argument("--password", default="")
     add("default", "back to the default effect and palette")
     p_name = add("rename", "set the lamp name and/or hostname")
     p_name.add_argument("--set-name", dest="new_name", help="the free-text lamp name")
@@ -479,6 +499,8 @@ def main(argv=None) -> int:
                 result = lamp.set_effect(args.effect, colors, args.seconds)
             elif args.command == "effects":
                 result = lamp.effects()
+            elif args.command == "broker":
+                result = lamp.set_broker(args.host, args.port, args.user, args.password)
             elif args.command == "default":
                 result = lamp.reset_effect()
             elif args.command == "rename":

@@ -40,12 +40,20 @@ public:
     uint8_t brightness() const { return bright; }
     bool power() const { return on; }
 
+    // The broker. An empty host means MQTT is off, which is the default and a
+    // fully supported way to run a lamp -- see docs/home-assistant-control.md.
+    const String &mqttHost() const { return broker; }
+    uint16_t mqttPort() const { return brokerPort; }
+    const String &mqttUser() const { return brokerUser; }
+    const String &mqttPass() const { return brokerPass; }
+
     // Each of these writes through to NVS immediately. The lamp is switched by
     // Home Assistant, and an off that does not survive a power cut is a lamp
     // that comes back on by itself in the middle of the night.
     void saveBrightness(uint8_t value);
     void savePower(bool value);
     void saveNames(const String &newLabel, const String &newHost);
+    void saveBroker(const String &host, uint16_t port, const String &user, const String &pass);
 
 private:
     ConfigServer &configServer;
@@ -54,6 +62,10 @@ private:
     String label;
     uint8_t bright = 64;
     bool on = true;
+    String broker;
+    uint16_t brokerPort = 1883;
+    String brokerUser;
+    String brokerPass;
 
     // ===== Pages =====
     void handleHome();
@@ -74,6 +86,7 @@ private:
     void handleApiEffectReset();
     void handleApiEffects();
     void handleApiName();
+    void handleApiBroker();
     void handleApiOtaCheck();
     void handleApiOtaInstall();
     void handleApiOtaUpdate();

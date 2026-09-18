@@ -136,9 +136,9 @@ curl -X POST http://glow-lamp-051860.local/api/effect/reset
 | Effect | What it does |
 |---|---|
 | `blend` | The whole ring holds one color and eases to the next. The default. |
-| `loop` | The palette wrapped around the ring, rotating. |
-| `flicker` | One color at a time, each LED guttering on its own, like a candle. |
-| `neon` | A color per LED, each failing on its own schedule, like a neon sign. |
+| `loop` | Walks the palette steadily, never resting on a color. |
+| `flicker` | Similar colors mixing and guttering, like a flame. The one effect that lights the ring several colors at once. |
+| `neon` | One color, steady, with the stutter of a failing neon tube. |
 
 Up to 5 colors. An effect reverts to the default after 5 minutes unless you say
 otherwise, is capped at 8 hours, and does not survive a reboot — see
@@ -162,8 +162,21 @@ A lamp has two:
 
 ## Home Assistant
 
-`scripts/glowlamp.py` finds the lamps and drives them, using only the standard
-library so it runs under Home Assistant's Python:
+Set an MQTT broker on the lamp and it appears as a light entity by itself — with
+brightness, a color picker and the effect list — with nothing added to
+`configuration.yaml` and no restart:
+
+```sh
+./scripts/glowlamp.py broker 192.168.1.10 --host castor-lamp.local
+```
+
+See [docs/mqtt.md](docs/mqtt.md) for the topics and commands, and
+[docs/home-assistant-control.md](docs/home-assistant-control.md) for why MQTT
+rather than REST from Home Assistant. MQTT is optional: a lamp with no broker
+never connects and is fully usable over REST.
+
+`scripts/glowlamp.py` finds the lamps and drives them over REST, using only the
+standard library so it runs under Home Assistant's Python:
 
 ```sh
 ./scripts/glowlamp.py discover
@@ -175,6 +188,10 @@ library so it runs under Home Assistant's Python:
 See [docs/home-assistant.md](docs/home-assistant.md) for the REST switch and
 `shell_command` configuration, including turning every lamp off with the rest of
 the house.
+
+[docs/home-assistant-control.md](docs/home-assistant-control.md) covers what
+Home Assistant can and cannot do with a lamp, what each way in costs, and why
+MQTT is the recommended route.
 
 ## Finding the lamps
 

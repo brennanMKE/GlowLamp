@@ -8,6 +8,7 @@
 
 #include "effects.h"
 #include "lamp.h"
+#include "mqtt.h"
 #include "ota.h"
 #include "version.h"
 #include "wifi_link.h"
@@ -39,10 +40,15 @@ void LampSettings::begin() {
     label = p.isKey("label") ? p.getString("label") : host;
     if (p.isKey("bright")) bright = p.getUChar("bright");
     if (p.isKey("power")) on = p.getBool("power");
+    broker = p.isKey("mqtt_host") ? p.getString("mqtt_host") : String(MQTT_HOST);
+    brokerPort = p.isKey("mqtt_port") ? p.getUShort("mqtt_port") : MQTT_PORT;
+    brokerUser = p.isKey("mqtt_user") ? p.getString("mqtt_user") : String(MQTT_USER);
+    brokerPass = p.isKey("mqtt_pass") ? p.getString("mqtt_pass") : String(MQTT_PASS);
     p.end();
 
-    ESP_LOGI(TAG, "host=%s label=%s brightness=%u power=%s", host.c_str(), label.c_str(), bright,
-             on ? "on" : "off");
+    ESP_LOGI(TAG, "host=%s label=%s brightness=%u power=%s broker=%s", host.c_str(),
+             label.c_str(), bright, on ? "on" : "off",
+             broker.length() ? broker.c_str() : "(none)");
 }
 
 void LampSettings::saveBrightness(uint8_t value) {
@@ -69,6 +75,26 @@ void LampSettings::saveNames(const String &newLabel, const String &newHost) {
     p.putString("label", label);
     p.putString("name", host);
     p.end();
+}
+
+void LampSettings::saveBroker(const String &newHost, uint16_t newPort, const String &newUser,
+                              const String &newPass) {
+    broker = newHost;
+    brokerPort = newPort;
+    brokerUser = newUser;
+    brokerPass = newPass;
+
+    Preferences p;
+    p.begin(NVS_NS, false);
+    p.putString("mqtt_host", broker);
+    p.putUShort("mqtt_port", brokerPort);
+    p.putString("mqtt_user", brokerUser);
+    p.putString("mqtt_pass", brokerPass);
+    p.end();
+
+    // Drop the current connection so the new settings take effect without a
+    // reboot -- the point of editing them on a running lamp.
+    mqttSettingsChanged();
 }
 
 String LampSettings::sanitizeHost(const String &in) {
@@ -110,6 +136,7 @@ void LampSettings::registerRoutes() {
     server.on("/api/effect", HTTP_POST, std::bind(&LampSettings::handleApiEffect, this));
     server.on("/api/effect/reset", HTTP_POST, std::bind(&LampSettings::handleApiEffectReset, this));
     server.on("/api/name", HTTP_POST, std::bind(&LampSettings::handleApiName, this));
+    server.on("/api/broker", HTTP_POST, std::bind(&LampSettings::handleApiBroker, this));
     server.on("/api/ota/check", HTTP_POST, std::bind(&LampSettings::handleApiOtaCheck, this));
     server.on("/api/ota/install", HTTP_POST, std::bind(&LampSettings::handleApiOtaInstall, this));
     server.on("/api/ota/update", HTTP_POST, std::bind(&LampSettings::handleApiOtaUpdate, this));
@@ -226,13 +253,26 @@ String LampSettings::statusJson(bool pretty) const {
     // -1 rather than null for "not expiring", so a caller can compare a number
     // without first testing for absence.
     effect["expires_in"] = lampEffectExpiresIn();
-    JsonArray colors = effect["colors"].to<JsonArray>();
     uint32_t rgb[MAX_COLORS];
-    uint8_t count = lampEffectColors(rgb);
     char hex[8];
+
+    JsonArray colors = effect["colors"].to<JsonArray>();
+    uint8_t count = lampEffectColors(rgb);
     for (uint8_t i = 0; i < count; i++) {
         snprintf(hex, sizeof(hex), "#%06lx", (unsigned long)rgb[i]);
         colors.add(hex);
+    }
+
+    // What was last chosen, which resetting does not change. The settings page
+    // fills its pickers from this so "back to default" changes the lamp
+    // without also wiping the palette sitting in front of you.
+    JsonObject selected = effect["selected"].to<JsonObject>();
+    selected["name"] = lampSelectedName();
+    JsonArray chosen = selected["colors"].to<JsonArray>();
+    count = lampSelectedColors(rgb);
+    for (uint8_t i = 0; i < count; i++) {
+        snprintf(hex, sizeof(hex), "#%06lx", (unsigned long)rgb[i]);
+        chosen.add(hex);
     }
 
     bool online = WiFi.status() == WL_CONNECTED;
@@ -242,6 +282,12 @@ String LampSettings::statusJson(bool pretty) const {
     net["ip"] = online ? WiFi.localIP().toString() : String();
     net["rssi"] = online ? WiFi.RSSI() : 0;
     net["mac"] = WiFi.macAddress();
+
+    JsonObject mqttObj = doc["mqtt"].to<JsonObject>();
+    mqttObj["enabled"] = mqttEnabled();
+    mqttObj["connected"] = mqttConnected();
+    mqttObj["host"] = broker;
+    mqttObj["port"] = brokerPort;
 
     JsonObject ota = doc["ota"].to<JsonObject>();
     ota["state"] = otaState();
@@ -435,11 +481,14 @@ void LampSettings::handleApiEffects() {
 
     JsonDocument doc;
     JsonArray list = doc["effects"].to<JsonArray>();
+    // The ring shows one color at a time, so these differ in how that color
+    // behaves over time, never in where it sits on the ring.
     const char *what[EFFECT_COUNT] = {
-        "The whole ring holds one color and eases to the next.",
-        "The palette wrapped around the ring, rotating.",
-        "One color, each LED flickering on its own, like a candle.",
-        "A color per LED, each failing on its own schedule, like neon.",
+        "Holds on a color, then eases to the next.",
+        "Walks the palette steadily, never resting on a color.",
+        "Similar colors mixing and guttering, like a flame. The one effect that "
+        "lights the ring several colors at once.",
+        "One color, steady, with the stutter of a failing neon tube.",
     };
     for (uint8_t i = 0; i < EFFECT_COUNT; i++) {
         JsonObject e = list.add<JsonObject>();
@@ -570,6 +619,33 @@ void LampSettings::handleApiName() {
     saveNames(newLabel, newHost);
     ESP_LOGI(TAG, "renamed: label=%s host=%s%s", label.c_str(), host.c_str(),
              hostChanged ? " (reboot to publish)" : "");
+    sendStatus();
+}
+
+// The broker password is never echoed back, here or anywhere: an empty one in
+// a request means "leave it alone", so the host can be changed without knowing
+// the password.
+void LampSettings::handleApiBroker() {
+    WebServer &server = configServer.getServer();
+    Params p(server);
+
+    String newHost = p.has("host") ? p.str("host") : broker;
+    newHost.trim();
+
+    long newPort = p.has("port") ? p.num("port", brokerPort) : brokerPort;
+    if (newPort < 1 || newPort > 65535) {
+        server.send(400, "application/json", "{\"error\":\"port must be 1-65535\"}");
+        return;
+    }
+
+    String newUser = p.has("user") ? p.str("user") : brokerUser;
+    String newPass = brokerPass;
+    if (p.has("pass") && p.str("pass").length()) newPass = p.str("pass");
+
+    saveBroker(newHost, (uint16_t)newPort, newUser, newPass);
+    ESP_LOGI(TAG, "broker set to %s:%ld user=%s",
+             newHost.length() ? newHost.c_str() : "(none)", newPort,
+             newUser.length() ? newUser.c_str() : "(none)");
     sendStatus();
 }
 
@@ -748,6 +824,8 @@ void LampSettings::handleHome() {
          "'></span><span id='color'>" + lampColorHex() + "</span></td></tr>";
     b += rowId("State", lampPower() ? "on" : "off", "state");
     b += rowId("Effect", lampEffectName(), "effect");
+    b += rowId("MQTT", mqttEnabled() ? (mqttConnected() ? "connected" : "connecting") : "off",
+               "mqtt");
     b += "</table>";
 
     b += "<h2>Network</h2>";
@@ -782,6 +860,8 @@ void LampSettings::handleHome() {
          "document.getElementById('state').textContent=s.power;"
          "document.getElementById('effect').textContent="
          "s.effect.name+(s.effect.default?'':' (reverting)');"
+         "document.getElementById('mqtt').textContent="
+         "s.mqtt.enabled?(s.mqtt.connected?'connected':'connecting'):'off';"
          "document.getElementById('rssi').textContent="
          "s.network.online?s.network.rssi+' dBm':'\\u2014';"
          "document.getElementById('latest').textContent=s.ota.latest?s.ota.latest:'\\u2014';"
@@ -817,10 +897,10 @@ void LampSettings::handleSettingsGet() {
     b += "<label for='effect'>Effect</label>";
     b += "<select id='effect'>";
     const char *what[EFFECT_COUNT] = {
-        "Blend \u2014 one color at a time, easing between them",
-        "Loop \u2014 the palette rotating around the ring",
-        "Flicker \u2014 one color, guttering like a candle",
-        "Neon \u2014 a color per LED, each on its own schedule",
+        "Blend \u2014 holds a color, eases to the next",
+        "Loop \u2014 walks the palette, never resting",
+        "Flicker \u2014 mixes similar colors, like a flame",
+        "Neon \u2014 steady, with the stutter of a failing tube",
     };
     for (uint8_t i = 0; i < EFFECT_COUNT; i++) {
         b += "<option value='" + String(EFFECT_NAMES[i]) + "'>" + what[i] + "</option>";
@@ -878,11 +958,53 @@ void LampSettings::handleSettingsGet() {
     b += "<div class='form-group'>";
     b += "<label for='hostname'>Hostname</label>";
     b += "<input type='text' id='hostname' name='hostname' value='" + host + "' maxlength='18' required>";
-    b += "<small>Lowercase letters, digits and hyphens. Becomes <code>" + host +
-         "-&lt;mac&gt;.local</code> and the setup AP name. Needs a reboot.</small>";
+    b += "<small>Lowercase letters, digits and hyphens. The lamp answers at <code>" +
+         host + ".local</code>. Give each lamp its own name: two with the same one "
+         "would both reply to it. Needs a reboot.</small>";
     b += "</div>";
 
     b += "<div class='button-group'><button type='submit' class='button primary'>Save names</button></div>";
+    b += "</form>";
+
+    b += "<hr>";
+    b += "<form method='POST' action='/settings'>";
+    b += "<h2>Home Assistant</h2>";
+    b += "<div id='mqttstate'></div>";
+    b += "<div class='form-group'>";
+    b += "<label for='mqtthost'>MQTT broker</label>";
+    b += "<input type='text' id='mqtthost' name='mqtthost' value='" + broker +
+         "' placeholder='192.168.1.10'>";
+    b += "<small>Leave blank to turn MQTT off. With a broker set, the lamp announces "
+         "itself to Home Assistant and appears as a light \u2014 no YAML, no restart.</small>";
+    b += "</div>";
+
+    b += "<div class='form-group'>";
+    b += "<label for='mqttport'>Port</label>";
+    b += "<input type='text' id='mqttport' name='mqttport' inputmode='numeric' "
+         "pattern='[0-9]{1,5}' value='" + String(brokerPort) + "'>";
+    b += "</div>";
+
+    b += "<div class='form-group'>";
+    b += "<label for='mqttuser'>Username</label>";
+    b += "<input type='text' id='mqttuser' name='mqttuser' value='" + brokerUser +
+         "' autocomplete='username'>";
+    b += "</div>";
+
+    // The stored password is never rendered back into the page. An empty submit
+    // means "leave it alone", so the host can be changed without retyping it.
+    b += "<div class='form-group'>";
+    b += "<label for='mqttpass'>Password</label>";
+    b += "<input type='password' id='mqttpass' name='mqttpass' autocomplete='new-password' "
+         "placeholder='";
+    b += brokerPass.length() ? "unchanged" : "not set";
+    b += "'>";
+    b += "<small>";
+    b += brokerPass.length() ? "Leave blank to keep the stored password." : "No password set.";
+    b += "</small>";
+    b += "</div>";
+
+    b += "<div class='button-group'><button type='submit' class='button primary'>"
+         "Save broker</button></div>";
     b += "</form>";
 
     // Separate form: nesting it would submit the names too.
@@ -916,11 +1038,14 @@ void LampSettings::handleSettingsGet() {
          "box.innerHTML=\"<div class='status warning'>\"+f.name+\", reverting in \"+"
          "(m?m+'m ':'')+sec+\"s</div>\";}"
          "if(fxTouched)return;"
-         "document.getElementById('effect').value=f.name;"
+         // From f.selected, not f.colors: the pickers show what you chose,
+         // which is not always what the lamp is showing.
+         "var sel=f.selected;"
+         "document.getElementById('effect').value=sel.name;"
          "for(var i=0;i<5;i++){"
-         "var has=i<f.colors.length;"
+         "var has=i<sel.colors.length;"
          "document.getElementById('u'+i).checked=has;"
-         "if(has)document.getElementById('c'+i).value=f.colors[i];"
+         "if(has)document.getElementById('c'+i).value=sel.colors[i];"
          "}"
          "}"
          "document.getElementById('applyfx').onclick=function(){"
@@ -967,8 +1092,16 @@ void LampSettings::handleSettingsGet() {
          "document.getElementById('checkbtn').disabled=true;"
          "document.getElementById('checkbtn').textContent='Checking\\u2026';"
          "post('/api/ota/check',{}).catch(()=>{});};"
+         "function mqttBox(m){"
+         "var box=document.getElementById('mqttstate');"
+         "if(!m.enabled){box.innerHTML=\"<div class='status'>MQTT is off. The lamp works "
+         "over its REST API.</div>\";return;}"
+         "box.innerHTML=m.connected"
+         "?\"<div class='status success'>Connected to \"+m.host+\"</div>\""
+         ":\"<div class='status warning'>Not connected to \"+m.host+\"</div>\";"
+         "}"
          "function u(){fetch('/api/status?pretty=0',{cache:'no-store'}).then(r=>r.json()).then(s=>{"
-         "render(s);otaBox(s.ota);fxRender(s.effect);"
+         "render(s);otaBox(s.ota);fxRender(s.effect);mqttBox(s.mqtt);"
          "}).catch(()=>{});}"
          "setInterval(u,1000);u();"
          "</script>";
@@ -992,6 +1125,26 @@ void LampSettings::handleSettingsSave() {
 
     bool hostChanged = newHost != host;
     saveNames(newLabel, newHost);
+
+    // The settings page carries two forms that both post here, and only one is
+    // ever submitted at a time -- so the broker is written only when its fields
+    // are actually present, and the names form does not blank the broker.
+    if (server.hasArg("mqtthost")) {
+        String bHost = server.arg("mqtthost");
+        bHost.trim();
+        uint16_t bPort = brokerPort;
+        if (server.hasArg("mqttport")) {
+            long v = server.arg("mqttport").toInt();
+            if (v > 0 && v <= 65535) bPort = (uint16_t)v;
+        }
+        String bUser = server.hasArg("mqttuser") ? server.arg("mqttuser") : brokerUser;
+        String bPass = brokerPass;
+        if (server.hasArg("mqttpass") && server.arg("mqttpass").length()) {
+            bPass = server.arg("mqttpass");
+        }
+        saveBroker(bHost, bPort, bUser, bPass);
+    }
+
     ESP_LOGI(TAG, "saved: label=%s host=%s", label.c_str(), host.c_str());
 
     String b;
@@ -1056,13 +1209,7 @@ void LampSettings::handleReboot() {
     ESP.restart();
 }
 
-String LampSettings::expectedHostname() const {
-    uint8_t mac[6];
-    WiFi.macAddress(mac);
-    char buf[48];
-    snprintf(buf, sizeof(buf), "%s-%02x%02x%02x.local", host.c_str(), mac[3], mac[4], mac[5]);
-    return String(buf);
-}
+String LampSettings::expectedHostname() const { return host + ".local"; }
 
 // The human- and agent-readable API reference, served by the lamp itself so it
 // travels with the firmware and cannot describe a version that is not running.
@@ -1126,7 +1273,8 @@ void LampSettings::handleHelp() {
             "it off. 1&ndash;60 seconds.");
     b += ep("GET", "/api/effects", "",
             "The four effects this firmware can render, with the color and duration "
-            "limits.");
+            "limits. The ring shows one color at a time, so effects differ in how that "
+            "color changes over time, not in where it sits on the ring.");
     b += ep("POST", "/api/effect",
             "{\"effect\": \"blend\", \"colors\": [\"#ff0000\"], \"seconds\": 300}",
             "Set the effect and up to five colors. <code>colors</code> may be omitted to "
@@ -1136,8 +1284,9 @@ void LampSettings::handleHelp() {
     b += ep("POST", "/api/effect/reset", "", "Back to the default effect and palette now.");
     b += ep("POST", "/api/name", "{\"name\": \"Living Room\", \"hostname\": \"glow-lamp\"}",
             "Rename. <code>name</code> is free text and takes effect immediately; "
-            "<code>hostname</code> is lowercase letters, digits and hyphens, and needs a "
-            "reboot because mDNS has already published the old one.");
+            "<code>hostname</code> is lowercase letters, digits and hyphens and becomes "
+            "<code>&lt;hostname&gt;.local</code>, and needs a reboot because mDNS has "
+            "already published the old one.");
     b += ep("POST", "/api/ota/check", "",
             "Ask GitHub for the latest release. Installs nothing &mdash; read the result "
             "from <code>ota</code> in the status a second or two later.");
@@ -1148,6 +1297,10 @@ void LampSettings::handleHelp() {
             "Check, and install only if the latest release differs from what is running. "
             "One call, nothing to decide on the caller's side, and a no-op when there is "
             "nothing new &mdash; this is the one to put on a nightly schedule.");
+    b += ep("POST", "/api/broker",
+            "{\"host\": \"192.168.1.10\", \"port\": 1883, \"user\": \"\", \"pass\": \"\"}",
+            "Set the MQTT broker. An empty host turns MQTT off. An empty password leaves "
+            "the stored one alone. Takes effect without a reboot.");
     b += ep("POST", "/api/reboot", "", "Reboot the lamp.");
 
     b += "<h2>Examples</h2>";
@@ -1169,10 +1322,24 @@ void LampSettings::handleHelp() {
     b += "# nightly: take a new release if there is one, do nothing if not\n";
     b += "curl -X POST " + base + "/api/ota/update</code></pre>";
 
+    b += "<h2>Home Assistant</h2>";
+    b += "<p class='api'>With a broker configured the lamp publishes a retained discovery "
+         "config to <b>homeassistant/light/&lt;id&gt;/config</b> and becomes a light entity "
+         "on its own &mdash; no YAML and no restart. It subscribes to "
+         "<b>glowlamp/&lt;hostname&gt;/set</b> (Home Assistant's JSON light schema: state, "
+         "brightness, color, effect), publishes retained state to "
+         "<b>glowlamp/&lt;hostname&gt;/state</b>, and carries a last will on "
+         "<b>glowlamp/&lt;hostname&gt;/availability</b> so the entity goes unavailable when "
+         "the lamp drops off.</p>";
+    b += "<p class='api'>Anything set over MQTT has no expiry: Home Assistant is a "
+         "controller, and an effect that reverted after five minutes would leave the entity "
+         "showing a state the lamp no longer has. MQTT is optional &mdash; a lamp with no "
+         "broker is fully usable here.</p>";
+
     b += "<h2>Status fields</h2>";
     b += "<table>";
     b += row("name", "What this lamp is called.");
-    b += row("hostname", "The mDNS label; the lamp answers at <code>&lt;hostname&gt;-&lt;mac&gt;.local</code>.");
+    b += row("hostname", "The mDNS label; the lamp answers at <code>&lt;hostname&gt;.local</code>.");
     b += row("version", "Firmware version, matching a GitHub release tag.");
     b += row("on / power", "Boolean and the same thing as <code>\"on\"</code> or <code>\"off\"</code>.");
     b += row("brightness", "0&ndash;255, what it shows at when on.");

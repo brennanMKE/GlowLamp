@@ -49,6 +49,7 @@ one can control it.
 | POST | `/api/effect` | `{"effect": "...", "colors": [...], "seconds": 300}` |
 | POST | `/api/effect/reset` | — |
 | POST | `/api/name` | `{"name": "...", "hostname": "..."}` |
+| POST | `/api/broker` | `{"host": "...", "port": 1883, "user": "", "pass": ""}` |
 | POST | `/api/ota/check` | — |
 | POST | `/api/ota/install` | — |
 | POST | `/api/ota/update` | — |
@@ -82,9 +83,19 @@ curl -X POST http://lamp.local/api/effect/reset
 | Effect | What it does |
 |---|---|
 | `blend` | The whole ring holds one color and eases to the next. The default. |
-| `loop` | The palette wrapped around the ring, rotating. |
-| `flicker` | One color at a time, each LED guttering on its own, like a candle. |
-| `neon` | A color per LED, each failing on its own schedule, like a neon sign. |
+| `loop` | Walks the palette steadily, never resting on a color. |
+| `flicker` | Similar colors mixing and guttering, like a flame. |
+| `neon` | One color, steady, with the stutter of a failing neon tube. |
+
+**The ring shows one color at a time.** It is one light behind a diffuser, not
+eight addressable pixels: several colors an inch apart mix into white. So
+`blend`, `loop` and `neon` light the whole ring a single color, and differ in
+how that color changes over time rather than in where it sits on the ring.
+
+`flicker` is the deliberate exception, and relies on that mixing — give it a few
+colors that are already close together, like reds and ambers, and the LEDs
+blurring into each other at different brightnesses read as fire. Five colors
+from opposite sides of the wheel will go white.
 
 `colors` is up to 5 hex strings. The `#` is optional, which matters in a URL
 where it would otherwise start a fragment. Omitting `colors` keeps the palette
@@ -110,6 +121,17 @@ never leaves full saturation. The colors you send are echoed back unchanged —
 letters, digits and hyphens, and needs a reboot: mDNS has already published the
 old one by the time the request is answered. A hostname that sanitizes away to
 nothing is a 400.
+
+### MQTT broker
+
+```sh
+curl -X POST 'http://lamp.local/api/broker?host=192.168.1.10&port=1883'
+curl -X POST 'http://lamp.local/api/broker?host='      # turns MQTT off
+```
+
+An empty `host` disables MQTT; an empty `pass` leaves the stored one alone. The
+password is never echoed back in `status`. Takes effect without a reboot. See
+[mqtt.md](mqtt.md).
 
 ### Firmware
 

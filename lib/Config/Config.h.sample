@@ -14,6 +14,16 @@
 // the real value to NVS.
 static const char *DEVICE_NAME = "glow-lamp";
 
+// ===== MQTT broker =====
+// Defaults only, and empty on purpose: a lamp with no broker never connects and
+// works fully over REST. The Settings page writes the real values to NVS and
+// those win from then on. Credentials belong on the device, not in a build --
+// this file is a template that gets committed.
+static const char *MQTT_HOST = "";
+static const uint16_t MQTT_PORT = 1883;
+static const char *MQTT_USER = "";
+static const char *MQTT_PASS = "";
+
 // ===== GitHub OTA =====
 // Releases are pulled from https://github.com/<OTA_GITHUB_REPO>/releases/latest
 // and the asset must be named firmware.bin. See scripts/release.sh.

@@ -1,5 +1,9 @@
 # Home Assistant
 
+For what Home Assistant can do with a lamp before any of this is set up, what
+each route costs, and why MQTT is recommended over both of the below, see
+[home-assistant-control.md](home-assistant-control.md).
+
 Two ways to wire these lamps in. They are not exclusive — the REST switch is
 what Home Assistant polls day to day, and the script is what finds the lamps in
 the first place and does the bulk work.

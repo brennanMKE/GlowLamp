@@ -67,4 +67,14 @@ int32_t lampEffectExpiresIn();
 // True while the built-in default is what is showing.
 bool lampEffectIsDefault();
 
+// The last effect and palette someone chose, which is NOT what resetting
+// changes. Reverting to the default is about what the lamp shows, not about
+// forgetting what you picked -- so the settings page can put your colors back
+// in front of you even while the lamp is showing its own.
+//
+// Seeded with the defaults at boot, so a lamp nobody has configured still
+// offers a sensible starting palette.
+const char *lampSelectedName();
+uint8_t lampSelectedColors(uint32_t *out);
+
 #endif  // LAMP_H

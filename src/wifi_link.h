@@ -15,8 +15,9 @@
 // version, and the path to the Settings page.
 #define MDNS_SERVICE "glowlamp"
 
-// The .local name EasyWiFi published, e.g. "glow-lamp-d0ffdc.local".
-// Empty until mDNS has started.
+// The .local name this lamp answers to, e.g. "castor-lamp.local". This is the
+// bare hostname: EasyWiFi appends the MAC to the one it publishes, and
+// loopWifiLink() restarts mDNS without it. Empty until mDNS has started.
 #define MDNS_HOSTNAME_HINT mdnsHostname()
 const char *mdnsHostname();
 

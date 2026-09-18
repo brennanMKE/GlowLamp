@@ -116,9 +116,33 @@ so nothing a browser can prefetch can switch a lamp off or reflash it. There is
 no authentication: these are LAN devices, and anything that can reach one can
 control it.
 
-`http://<lamp>/help` is the full reference, served by the lamp so it always
-describes the firmware actually running. `/api` is the same thing as JSON, for
-an agent that would rather not read HTML.
+A JSON body is only read when the request sets
+`Content-Type: application/json` — curl's default is form-encoded, and the HTTP
+server discards a JSON document sent that way before the firmware sees it. Query
+parameters never have that problem, which is why they lead here.
+
+[docs/rest-api.md](docs/rest-api.md) is the full reference.
+`http://<lamp>/help` is the same thing served by the lamp, so it always
+describes the firmware actually running, and `/api` is that as JSON for an agent
+that would rather not read HTML.
+
+### Effects
+
+```sh
+curl -X POST 'http://glow-lamp-051860.local/api/effect?effect=neon&colors=ff0000,00ff00,0000ff'
+curl -X POST http://glow-lamp-051860.local/api/effect/reset
+```
+
+| Effect | What it does |
+|---|---|
+| `blend` | The whole ring holds one color and eases to the next. The default. |
+| `loop` | The palette wrapped around the ring, rotating. |
+| `flicker` | One color at a time, each LED guttering on its own, like a candle. |
+| `neon` | A color per LED, each failing on its own schedule, like a neon sign. |
+
+Up to 5 colors. An effect reverts to the default after 5 minutes unless you say
+otherwise, is capped at 8 hours, and does not survive a reboot — see
+[docs/rest-api.md](docs/rest-api.md#effects) for why that is the default.
 
 ### Identify
 

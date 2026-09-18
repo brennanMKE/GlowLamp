@@ -3,6 +3,7 @@
 #include <esp_log.h>
 
 #include "every_n_millis.h"
+#include "effects.h"
 #include "lamp.h"
 #include "ota.h"
 #include "settings.h"
@@ -12,36 +13,47 @@
 static const char *TAG = "LAMP";
 
 // ===== Ring layout =====
-// One ring of 8 WS2812B LEDs. Every LED always shows the same color -- the ring
-// is one light, not eight addressable pixels. Later versions may break that.
+// One ring of 8 WS2812B LEDs. Which LED shows which color is up to the effect;
+// blend and flicker light the whole ring the same, loop and neon do not.
 #define DATA_PIN 4
 #define NUM_LEDS 8
 
-// ===== Palette =====
-// Three vibrant colors the lamp blends between, in cycle order. Saturated and
-// far apart in hue on purpose: WS2812B washes pastels out to near-white, and a
-// blend between two neighboring hues reads as one slowly shifting color rather
-// than as a cycle.
-static const CRGB PALETTE[] = {
-    CRGB(255, 0, 40),    // magenta-red
-    CRGB(0, 120, 255),   // azure
-    CRGB(0, 255, 90),    // spring green
+// ===== Default palette =====
+//
+// Five colors, as hue and saturation. Given as hues rather than RGB triples
+// because that is what the renderers blend in, and because a hue is the one
+// form that cannot accidentally be pale: saturation 255 is vivid by
+// construction, whatever the hue.
+//
+// Spaced 40-56 apart around the wheel so no two are close enough to read as
+// the same color on a ring this small. Deliberately no white, no amber and no
+// pastel: on a WS2812B those wash out, and the whole point of the palette is
+// that the lamp is never showing something that looks like a dirty bulb.
+static const PaletteColor DEFAULT_PALETTE[] = {
+    {0, 255},    // red
+    {40, 255},   // gold
+    {96, 255},   // green
+    {150, 255},  // azure
+    {200, 255},  // magenta
 };
-static const uint8_t PALETTE_SIZE = sizeof(PALETTE) / sizeof(PALETTE[0]);
+static const uint8_t DEFAULT_PALETTE_SIZE =
+    sizeof(DEFAULT_PALETTE) / sizeof(DEFAULT_PALETTE[0]);
 
 // ===== Timing =====
-// Milliseconds to cross from one palette color to the next, so a full cycle is
-// BLEND_MS * PALETTE_SIZE. Slow on purpose: at a few seconds per leg the ring
-// reads as a color-changing lamp; much faster and it reads as an effect.
+// Milliseconds to cross from one palette color to the next, so a full blend
+// cycle is BLEND_MS * colorCount -- 30 seconds on the five defaults. Slow on
+// purpose: at a few seconds per leg the ring reads as a color-changing lamp,
+// much faster and it reads as an effect.
 static const uint32_t BLEND_MS = 6000;
 
-// ~60 fps. Faster buys nothing visible on a blend this slow, and each show()
-// disables interrupts for roughly 30 us per LED.
+// One full revolution of the loop effect.
+static const uint32_t LOOP_MS = 8000;
+
+// ~60 fps. Faster buys nothing visible and each show() disables interrupts for
+// roughly 30 us per LED.
 static const uint32_t FRAME_MS = 16;
 
 static const uint8_t DEFAULT_BRIGHTNESS = 64;
-
-CRGB leds[NUM_LEDS];
 
 // How long the identify flash lasts by default, and how long each blink is.
 // 150 ms reads as a deliberate signal; much faster looks like a fault.
@@ -51,18 +63,36 @@ static const uint32_t IDENTIFY_BLINK_MS = 150;
 // announces itself. Restored to the configured value when the flash ends.
 static const uint8_t IDENTIFY_MIN_BRIGHTNESS = 160;
 
+CRGB leds[NUM_LEDS];
+
 // ===== State =====
 static uint8_t brightness = DEFAULT_BRIGHTNESS;
 static bool power = true;
-static CRGB currentColor = PALETTE[0];
+static CRGB currentColor = CRGB::Black;
 
 static bool identifying = false;
 static uint32_t identifyStart = 0;
 static uint32_t identifyEnd = 0;
 
+static EffectState fx;
+static uint8_t effectMode = EFFECT_BLEND;
+
+// What the API reports back, kept alongside the hue/saturation the renderers
+// use so a caller reading its colors back sees the values it sent rather than
+// what survived a round trip through the color wheel.
+static uint32_t effectRgb[MAX_COLORS];
+static uint8_t effectRgbCount = 0;
+
+static bool effectIsDefault = true;
+static bool effectHasExpiry = false;
+static uint32_t effectExpiresAt = 0;
+
 uint8_t lampBrightness() { return brightness; }
 bool lampPower() { return power; }
 bool lampIdentifying() { return identifying; }
+uint8_t lampEffectMode() { return effectMode; }
+const char *lampEffectName() { return EFFECT_NAMES[effectMode]; }
+bool lampEffectIsDefault() { return effectIsDefault; }
 
 void setLampBrightness(uint8_t value) {
     brightness = value;
@@ -86,37 +116,126 @@ String lampColorHex() {
     return String(buf);
 }
 
-// Phase is accumulated from elapsed time rather than taken as millis() % cycle.
-// The modulo form jumps at the millis() rollover -- a visible color snap once
-// every 49.7 days -- because the wrap point is not a multiple of the cycle.
-// Unsigned subtraction of two samples is exact across the wrap, so accumulating
-// the difference is not.
+// Applying a palette resets the per-LED timers with it. Without this, the LEDs
+// a flicker effect had already scheduled would keep their old deadlines and
+// the new palette would arrive one LED at a time over the following second.
+static void applyPalette(const PaletteColor *colors, uint8_t count) {
+    fx.colorCount = count;
+    for (uint8_t i = 0; i < count; i++) fx.colors[i] = colors[i];
+
+    uint32_t now = millis();
+    for (uint8_t i = 0; i < NUM_LEDS; i++) fx.timeouts[i] = now;
+    fx.hueTimeout = now + 3000;
+    fx.hueIndex = 0;
+}
+
+void resetLampEffect() {
+    effectMode = EFFECT_BLEND;
+    applyPalette(DEFAULT_PALETTE, DEFAULT_PALETTE_SIZE);
+
+    // Report the defaults in the same form a caller would have sent them.
+    for (uint8_t i = 0; i < DEFAULT_PALETTE_SIZE; i++) {
+        CRGB rgb = CHSV(DEFAULT_PALETTE[i].h, DEFAULT_PALETTE[i].s, 255);
+        effectRgb[i] = ((uint32_t)rgb.r << 16) | ((uint32_t)rgb.g << 8) | rgb.b;
+    }
+    effectRgbCount = DEFAULT_PALETTE_SIZE;
+
+    effectIsDefault = true;
+    effectHasExpiry = false;
+}
+
+bool setLampEffect(uint8_t mode, const uint32_t *colors, uint8_t count, uint32_t seconds) {
+    if (mode >= EFFECT_COUNT) return false;
+    if (count == 0 || count > MAX_COLORS) return false;
+
+    PaletteColor palette[MAX_COLORS];
+    for (uint8_t i = 0; i < count; i++) {
+        CRGB rgb((colors[i] >> 16) & 0xFF, (colors[i] >> 8) & 0xFF, colors[i] & 0xFF);
+        // rgb2hsv_approximate is lossy, which is exactly why the original
+        // 0xRRGGBB is kept for reporting. What matters here is that the
+        // renderers get a hue they can travel along without crossing gray.
+        CHSV hsv = rgb2hsv_approximate(rgb);
+        palette[i].h = hsv.h;
+        // A color dark enough to have no meaningful hue -- near-black -- would
+        // otherwise render as an arbitrary one at full saturation. Treating it
+        // as unsaturated lets it read as the dim white it is.
+        palette[i].s = hsv.v < 16 ? 0 : hsv.s;
+        effectRgb[i] = colors[i];
+    }
+
+    effectMode = mode;
+    effectRgbCount = count;
+    applyPalette(palette, count);
+
+    effectIsDefault = false;
+    effectHasExpiry = seconds > 0;
+    effectExpiresAt = millis() + seconds * 1000UL;
+
+    ESP_LOGI(TAG, "effect %s, %u colors, expires in %lus", EFFECT_NAMES[mode], count,
+             (unsigned long)seconds);
+    return true;
+}
+
+uint8_t lampEffectColors(uint32_t *out) {
+    for (uint8_t i = 0; i < effectRgbCount; i++) out[i] = effectRgb[i];
+    return effectRgbCount;
+}
+
+int32_t lampEffectExpiresIn() {
+    if (effectIsDefault || !effectHasExpiry) return -1;
+    uint32_t now = millis();
+    if (timeReached(now, effectExpiresAt)) return 0;
+    return (int32_t)((effectExpiresAt - now) / 1000);
+}
+
 static void loopLeds() {
     static uint32_t lastFrame = 0;
-    static uint32_t phase = 0;  // ms into the full cycle
 
     uint32_t now = millis();
     uint32_t delta = now - lastFrame;
     if (delta < FRAME_MS) return;
     lastFrame = now;
 
-    phase = (phase + delta) % (BLEND_MS * PALETTE_SIZE);
+    // An effect outlives its welcome by default, not by exception: anything set
+    // over the API reverts on its own, so a lamp left mid-experiment finds its
+    // way back without anyone remembering to put it there.
+    if (effectHasExpiry && timeReached(now, effectExpiresAt)) {
+        ESP_LOGI(TAG, "effect expired, back to the default");
+        resetLampEffect();
+    }
 
-    uint8_t from = phase / BLEND_MS;
-    uint8_t to = (from + 1) % PALETTE_SIZE;
+    // Phase accumulates from elapsed time rather than being taken as
+    // millis() % cycle. The modulo form jumps at the millis() rollover -- a
+    // visible color snap once every 49.7 days -- because the wrap point is not
+    // a multiple of the cycle. Unsigned subtraction of two samples is exact
+    // across the wrap, so accumulating the difference is too.
+    fx.phase += delta;
 
-    // 0..255 across the leg. The multiply is done before the divide and in
-    // 32-bit, so a 6000 ms leg does not lose resolution to integer truncation.
-    uint8_t t = ((phase % BLEND_MS) * 255UL) / BLEND_MS;
+    // The effect renders whatever the lamp is doing, so power and identify only
+    // decide what reaches the LEDs. Switching back on resumes the color the
+    // effect would have been on rather than restarting it.
+    switch (effectMode) {
+        case EFFECT_LOOP:
+            fx.phase %= LOOP_MS;
+            renderLoop(fx, LOOP_MS);
+            break;
+        case EFFECT_FLICKER:
+            renderFlicker(fx, now);
+            break;
+        case EFFECT_NEON:
+            renderNeon(fx, now);
+            break;
+        case EFFECT_BLEND:
+        default:
+            fx.phase %= BLEND_MS * fx.colorCount;
+            renderBlend(fx, BLEND_MS);
+            break;
+    }
 
-    // Ease in and out so the lamp lingers on each palette color instead of
-    // sweeping past it -- a linear blend spends as little time on the pure
-    // colors as on the muddy midpoint between them.
-    currentColor = blend(PALETTE[from], PALETTE[to], ease8InOutCubic(t));
+    // What the status page reports. Taken after rendering so it is the color
+    // the ring is actually showing, whichever effect drew it.
+    currentColor = leds[0];
 
-    // The cycle above keeps running whatever the lamp is showing, so power and
-    // identify only decide what gets rendered. Switching back on resumes the
-    // color the lamp would have been on, rather than restarting the cycle.
     if (identifying) {
         // timeReached() rather than a plain compare, and elapsed rather than an
         // absolute deadline: both survive the millis() rollover. See
@@ -132,7 +251,7 @@ static void loopLeds() {
         }
     }
 
-    fill_solid(leds, NUM_LEDS, power ? currentColor : CRGB::Black);
+    if (!power) fill_solid(leds, NUM_LEDS, CRGB::Black);
     FastLED.show();
 }
 
@@ -144,9 +263,13 @@ void setup() {
     FastLED.setMaxPowerInVoltsAndMilliamps(5, 500);  // volts, mA
     FastLED.clear(true);
 
+    fx.leds = leds;
+    fx.numLeds = NUM_LEDS;
+    resetLampEffect();
+
     Serial.println("\n=== Glow Lamp " FIRMWARE_VERSION " ===");
-    ESP_LOGI(TAG, "%d LEDs on pin %d, %lu ms per blend", NUM_LEDS, DATA_PIN,
-             (unsigned long)BLEND_MS);
+    ESP_LOGI(TAG, "%d LEDs on pin %d, %d effects, %d default colors", NUM_LEDS, DATA_PIN,
+             EFFECT_COUNT, DEFAULT_PALETTE_SIZE);
 
     // Brightness and the power state come out of NVS, so setupWifiLink()
     // (which calls settings.begin()) has to run before they are applied. A lamp

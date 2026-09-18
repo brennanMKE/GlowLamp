@@ -6,6 +6,7 @@
 #include <WiFi.h>
 #include <esp_log.h>
 
+#include "effects.h"
 #include "lamp.h"
 #include "ota.h"
 #include "version.h"
@@ -105,6 +106,9 @@ void LampSettings::registerRoutes() {
     server.on("/api/power", HTTP_POST, std::bind(&LampSettings::handleApiPower, this));
     server.on("/api/brightness", HTTP_POST, std::bind(&LampSettings::handleApiBrightness, this));
     server.on("/api/identify", HTTP_POST, std::bind(&LampSettings::handleApiIdentify, this));
+    server.on("/api/effects", HTTP_GET, std::bind(&LampSettings::handleApiEffects, this));
+    server.on("/api/effect", HTTP_POST, std::bind(&LampSettings::handleApiEffect, this));
+    server.on("/api/effect/reset", HTTP_POST, std::bind(&LampSettings::handleApiEffectReset, this));
     server.on("/api/name", HTTP_POST, std::bind(&LampSettings::handleApiName, this));
     server.on("/api/ota/check", HTTP_POST, std::bind(&LampSettings::handleApiOtaCheck, this));
     server.on("/api/ota/install", HTTP_POST, std::bind(&LampSettings::handleApiOtaInstall, this));
@@ -140,6 +144,19 @@ public:
             // form post, whose fields are already in args.
             deserializeJson(doc, server.arg("plain"));
         }
+
+        // A JSON body only arrives when the request says it is JSON. Curl's
+        // default content type is application/x-www-form-urlencoded, and
+        // WebServer believes the header: it runs the body through its form
+        // parser, which drops any field without an '=' in it -- which is every
+        // JSON document. The body is gone before a handler can see it, so
+        // there is nothing to recover here.
+        //
+        // `curl -d '{"on":false}'` therefore sends nothing this API can read.
+        // That is why every documented example either passes a query parameter
+        // or sets the content type, and why a missing value is now an error
+        // rather than a default: the silent version of this had POST
+        // /api/power toggling instead of doing what the body said.
     }
 
     bool has(const char *key) const { return !doc[key].isNull() || server.hasArg(key); }
@@ -155,6 +172,14 @@ public:
         String s = str(key);
         return s.length() ? s.toInt() : fallback;
     }
+
+    // JsonArrayConst, not JsonArray: this method is const, so doc[key] hands
+    // back a const variant, and is<JsonArray>() asks whether it is a *mutable*
+    // array -- which a const variant never is. It compiles, returns false for
+    // every array, and sends the caller down the comma-separated-string path
+    // with "[\"#ff0000\"]" in hand.
+    bool isArray(const char *key) const { return doc[key].is<JsonArrayConst>(); }
+    JsonArrayConst array(const char *key) const { return doc[key].as<JsonArrayConst>(); }
 
     // Accepts real booleans, 0/1, and the words people and shell scripts
     // actually type. Anything unrecognized leaves the fallback in place rather
@@ -194,6 +219,21 @@ String LampSettings::statusJson(bool pretty) const {
     doc["brightness"] = lampBrightness();
     doc["color"] = lampColorHex();
     doc["identifying"] = lampIdentifying();
+
+    JsonObject effect = doc["effect"].to<JsonObject>();
+    effect["name"] = lampEffectName();
+    effect["default"] = lampEffectIsDefault();
+    // -1 rather than null for "not expiring", so a caller can compare a number
+    // without first testing for absence.
+    effect["expires_in"] = lampEffectExpiresIn();
+    JsonArray colors = effect["colors"].to<JsonArray>();
+    uint32_t rgb[MAX_COLORS];
+    uint8_t count = lampEffectColors(rgb);
+    char hex[8];
+    for (uint8_t i = 0; i < count; i++) {
+        snprintf(hex, sizeof(hex), "#%06lx", (unsigned long)rgb[i]);
+        colors.add(hex);
+    }
 
     bool online = WiFi.status() == WL_CONNECTED;
     JsonObject net = doc["network"].to<JsonObject>();
@@ -270,6 +310,11 @@ void LampSettings::handleApiIndex() {
     add("POST", "/api/power", "{\"on\": true | false | \"toggle\"}", "Switch the lamp on or off. Persists.");
     add("POST", "/api/brightness", "{\"value\": 0-255}", "Set brightness. Persists. Does not switch the lamp on.");
     add("POST", "/api/identify", "{\"seconds\": 1-60}", "Blink white so you can find this lamp.");
+    add("GET", "/api/effects", "", "The effects this firmware can render, and the limits.");
+    add("POST", "/api/effect",
+        "{\"effect\": \"blend\", \"colors\": [\"#ff0000\"], \"seconds\": 300}",
+        "Set the effect and palette. Reverts to the default when it expires.");
+    add("POST", "/api/effect/reset", "", "Back to the default effect and palette now.");
     add("POST", "/api/name", "{\"name\": \"Living Room\", \"hostname\": \"glow-lamp\"}",
         "Rename. A changed hostname needs a reboot to take effect.");
     add("POST", "/api/ota/check", "", "Ask GitHub for the latest release. Installs nothing.");
@@ -293,7 +338,17 @@ void LampSettings::handleApiIndex() {
 }
 
 void LampSettings::handleApiPower() {
-    Params p(configServer.getServer());
+    WebServer &server = configServer.getServer();
+    Params p(server);
+
+    // Refused rather than defaulted. A missing or unparseable value used to
+    // fall back to toggling, which meant a malformed request still changed the
+    // lamp -- and looked like it had worked.
+    if (!p.has("on")) {
+        server.send(400, "application/json",
+                    "{\"error\":\"send {\\\"on\\\": true | false | \\\"toggle\\\"}\"}");
+        return;
+    }
 
     // "toggle" is a string where the others are booleans, so it is checked
     // before flag() reduces the value to true/false.
@@ -337,6 +392,155 @@ void LampSettings::handleApiIdentify() {
 
     identifyLamp(ms);
     ESP_LOGI(TAG, "identify for %lu ms", (unsigned long)ms);
+    sendStatus();
+}
+
+
+// ===== Effects =====
+
+// How long an effect lasts when the caller does not say, and the ceiling on
+// what they can ask for. An effect is a thing someone is trying, not a new
+// permanent state, so it times out by default rather than by request.
+static const uint32_t EFFECT_DEFAULT_SECONDS = 300;      // 5 minutes
+static const uint32_t EFFECT_MAX_SECONDS = 8UL * 60 * 60;  // 8 hours
+
+// "#ff8800", "ff8800" or "0xff8800" -> 0xff8800. Returns false on anything
+// else, including a short form: "#f80" is a CSS convenience this does not
+// implement, and silently reading it as 0x000f80 would be worse than refusing.
+static bool parseHexColor(const String &in, uint32_t &out) {
+    String v = in;
+    v.trim();
+    if (v.startsWith("#")) v = v.substring(1);
+    else if (v.startsWith("0x") || v.startsWith("0X")) v = v.substring(2);
+    if (v.length() != 6) return false;
+
+    uint32_t value = 0;
+    for (unsigned i = 0; i < 6; i++) {
+        char c = v[i];
+        uint8_t digit;
+        if (c >= '0' && c <= '9') digit = c - '0';
+        else if (c >= 'a' && c <= 'f') digit = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F') digit = c - 'A' + 10;
+        else return false;
+        value = (value << 4) | digit;
+    }
+    out = value;
+    return true;
+}
+
+// What this firmware can render, so a caller does not have to guess at the
+// names or discover the limits by being refused.
+void LampSettings::handleApiEffects() {
+    WebServer &server = configServer.getServer();
+
+    JsonDocument doc;
+    JsonArray list = doc["effects"].to<JsonArray>();
+    const char *what[EFFECT_COUNT] = {
+        "The whole ring holds one color and eases to the next.",
+        "The palette wrapped around the ring, rotating.",
+        "One color, each LED flickering on its own, like a candle.",
+        "A color per LED, each failing on its own schedule, like neon.",
+    };
+    for (uint8_t i = 0; i < EFFECT_COUNT; i++) {
+        JsonObject e = list.add<JsonObject>();
+        e["name"] = EFFECT_NAMES[i];
+        e["description"] = what[i];
+    }
+    doc["max_colors"] = MAX_COLORS;
+    doc["default_seconds"] = EFFECT_DEFAULT_SECONDS;
+    doc["max_seconds"] = EFFECT_MAX_SECONDS;
+    doc["current"] = lampEffectName();
+
+    String out;
+    serializeJsonPretty(doc, out);
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(200, "application/json", out);
+}
+
+void LampSettings::handleApiEffect() {
+    WebServer &server = configServer.getServer();
+    Params p(server);
+
+    // Name, not index: an integer here would be a number someone has to look
+    // up, and would pin the wire format to the enum's order forever.
+    String wanted = p.str("effect", p.str("name"));
+    wanted.trim();
+    wanted.toLowerCase();
+    uint8_t mode = EFFECT_COUNT;
+    for (uint8_t i = 0; i < EFFECT_COUNT; i++) {
+        if (wanted == EFFECT_NAMES[i]) {
+            mode = i;
+            break;
+        }
+    }
+    if (mode == EFFECT_COUNT) {
+        String names;
+        for (uint8_t i = 0; i < EFFECT_COUNT; i++) {
+            if (i) names += ", ";
+            names += EFFECT_NAMES[i];
+        }
+        server.send(400, "application/json",
+                    "{\"error\":\"effect must be one of: " + names + "\"}");
+        return;
+    }
+
+    // Colors arrive either as a JSON array or as repeated/comma-separated
+    // form fields, so a browser form and a curl one-liner both work.
+    uint32_t colors[MAX_COLORS];
+    uint8_t count = 0;
+
+    if (p.isArray("colors")) {
+        for (JsonVariantConst v : p.array("colors")) {
+            if (count >= MAX_COLORS) break;
+            if (!parseHexColor(v.as<String>(), colors[count])) {
+                server.send(400, "application/json",
+                            "{\"error\":\"colors must be hex like #ff0000\"}");
+                return;
+            }
+            count++;
+        }
+    } else if (p.has("colors")) {
+        String list = p.str("colors");
+        while (list.length() && count < MAX_COLORS) {
+            int comma = list.indexOf(',');
+            String one = comma < 0 ? list : list.substring(0, comma);
+            list = comma < 0 ? String() : list.substring(comma + 1);
+            one.trim();
+            if (one.length() == 0) continue;
+            if (!parseHexColor(one, colors[count])) {
+                server.send(400, "application/json",
+                            "{\"error\":\"colors must be hex like #ff0000\"}");
+                return;
+            }
+            count++;
+        }
+    }
+
+    // No colors given means "this effect, the palette it is already showing",
+    // which is what makes switching effects from the UI a one-field call.
+    if (count == 0) count = lampEffectColors(colors);
+
+    uint32_t seconds = EFFECT_DEFAULT_SECONDS;
+    if (p.has("seconds")) {
+        long v = p.num("seconds", EFFECT_DEFAULT_SECONDS);
+        if (v < 0) v = 0;
+        // Clamped rather than refused: asking for a week is a reasonable way
+        // to say "as long as you will let me".
+        if ((uint32_t)v > EFFECT_MAX_SECONDS) v = EFFECT_MAX_SECONDS;
+        seconds = (uint32_t)v;
+    }
+
+    if (!setLampEffect(mode, colors, count, seconds)) {
+        server.send(400, "application/json",
+                    "{\"error\":\"could not apply that effect\"}");
+        return;
+    }
+    sendStatus();
+}
+
+void LampSettings::handleApiEffectReset() {
+    ESP_LOGI(TAG, "effect reset to the default");
+    resetLampEffect();
     sendStatus();
 }
 
@@ -430,6 +634,11 @@ static const char *EXTRA_CSS =
     "input[type=range]{width:100%;}"
     "#swatch{display:inline-block;width:14px;height:14px;border-radius:50%;"
     "margin-right:8px;vertical-align:-2px;border:1px solid rgba(0,0,0,.15);}"
+    ".swatchbox{display:inline-block;text-align:center;margin:0 10px 8px 0;}"
+    ".swatchbox input[type=color]{width:52px;height:38px;padding:0;border:1px solid #ddd;"
+    "border-radius:8px;background:none;cursor:pointer;display:block;}"
+    ".swatchbox label{font-size:12px;color:#999;font-weight:400;margin:4px 0 0;}"
+    ".swatchbox label input{margin-right:3px;}"
     ".api{font-size:14px;margin:0 0 18px;}"
     ".api b{font-family:ui-monospace,Menlo,monospace;font-size:13px;}"
     "</style>";
@@ -443,7 +652,15 @@ String LampSettings::page(const String &title, const String &bodyHtml) {
     html += "<h1>" + title + "</h1>";
     html += bodyHtml;
     html += "</div>";
-    html += webPages->getHTMLFooter();
+
+    // Not webPages->getHTMLFooter(): that renders "<device> v0.1", a version
+    // string hardcoded in EasyWiFi's WebPages.cpp that has never had anything
+    // to do with this firmware. It read as the lamp's own version and was
+    // wrong on every page. EasyWiFi's own /wifi pages still show it -- fixing
+    // those means fixing the library.
+    html += "<div class='footer'><small>";
+    html += label + " &middot; " FIRMWARE_VERSION;
+    html += "</small></div></body></html>";
     return html;
 }
 
@@ -530,6 +747,7 @@ void LampSettings::handleHome() {
     b += "<tr><th>Color</th><td><span id='swatch' style='background:" + lampColorHex() +
          "'></span><span id='color'>" + lampColorHex() + "</span></td></tr>";
     b += rowId("State", lampPower() ? "on" : "off", "state");
+    b += rowId("Effect", lampEffectName(), "effect");
     b += "</table>";
 
     b += "<h2>Network</h2>";
@@ -562,6 +780,8 @@ void LampSettings::handleHome() {
          "document.getElementById('color').textContent=s.color;"
          "document.getElementById('swatch').style.background=s.color;"
          "document.getElementById('state').textContent=s.power;"
+         "document.getElementById('effect').textContent="
+         "s.effect.name+(s.effect.default?'':' (reverting)');"
          "document.getElementById('rssi').textContent="
          "s.network.online?s.network.rssi+' dBm':'\\u2014';"
          "document.getElementById('latest').textContent=s.ota.latest?s.ota.latest:'\\u2014';"
@@ -590,6 +810,59 @@ void LampSettings::handleSettingsGet() {
 
     b += "<hr>";
     b += controlsHtml();
+
+    b += "<hr>";
+    b += "<h2>Effect</h2>";
+    b += "<div class='form-group'>";
+    b += "<label for='effect'>Effect</label>";
+    b += "<select id='effect'>";
+    const char *what[EFFECT_COUNT] = {
+        "Blend \u2014 one color at a time, easing between them",
+        "Loop \u2014 the palette rotating around the ring",
+        "Flicker \u2014 one color, guttering like a candle",
+        "Neon \u2014 a color per LED, each on its own schedule",
+    };
+    for (uint8_t i = 0; i < EFFECT_COUNT; i++) {
+        b += "<option value='" + String(EFFECT_NAMES[i]) + "'>" + what[i] + "</option>";
+    }
+    b += "</select>";
+    b += "</div>";
+
+    // Five pickers, each with a checkbox. A count field would make picking two
+    // colors mean "the first two", so the colors you want have to be the first
+    // ones in the row -- the checkbox lets any two be the two.
+    b += "<div class='form-group'>";
+    b += "<label>Colors <small style='display:inline;color:#999'>(up to 5)</small></label>";
+    b += "<div id='swatches'>";
+    for (uint8_t i = 0; i < MAX_COLORS; i++) {
+        String n = String(i);
+        b += "<span class='swatchbox'>";
+        b += "<input type='color' id='c" + n + "'>";
+        b += "<label><input type='checkbox' id='u" + n + "' checked> use</label>";
+        b += "</span>";
+    }
+    b += "</div></div>";
+
+    b += "<div class='form-group'>";
+    b += "<label for='secs'>Revert after</label>";
+    b += "<select id='secs'>";
+    b += "<option value='300' selected>5 minutes</option>";
+    b += "<option value='900'>15 minutes</option>";
+    b += "<option value='1800'>30 minutes</option>";
+    b += "<option value='3600'>1 hour</option>";
+    b += "<option value='14400'>4 hours</option>";
+    b += "<option value='28800'>8 hours</option>";
+    b += "<option value='0'>until the lamp reboots</option>";
+    b += "</select>";
+    b += "<small>An effect is temporary on purpose: when it expires the lamp goes "
+         "back to blending the five default colors. Nothing here survives a reboot.</small>";
+    b += "</div>";
+
+    b += "<div id='fxstate'></div>";
+    b += "<div class='button-group'>";
+    b += "<button id='applyfx' class='button primary'>Apply effect</button>";
+    b += "<button id='resetfx' class='button'>Back to default</button>";
+    b += "</div>";
 
     b += "<hr>";
     b += "<form method='POST' action='/settings'>";
@@ -623,7 +896,47 @@ void LampSettings::handleSettingsGet() {
 
     b += "<script>";
     b += controlsJs();
-    b += "var installing=false;"
+    b += "var fxTouched=false;"
+         // Once someone starts choosing, the poller stops overwriting their
+         // choices -- otherwise picking a color would be undone a second later
+         // by whatever the lamp is currently showing.
+         "document.getElementById('effect').onchange=function(){fxTouched=true;};"
+         "document.getElementById('secs').onchange=function(){fxTouched=true;};"
+         "for(var i=0;i<5;i++){"
+         "document.getElementById('c'+i).onchange=function(){fxTouched=true;};"
+         "document.getElementById('u'+i).onchange=function(){fxTouched=true;};"
+         "}"
+         "function fxRender(f){"
+         "var box=document.getElementById('fxstate');"
+         "if(f.default){box.innerHTML=\"<div class='status success'>Showing the default: \"+"
+         "f.name+\"</div>\";}"
+         "else if(f.expires_in<0){box.innerHTML=\"<div class='status warning'>\"+f.name+"
+         "\", until the lamp reboots</div>\";}"
+         "else{var m=Math.floor(f.expires_in/60),sec=f.expires_in%60;"
+         "box.innerHTML=\"<div class='status warning'>\"+f.name+\", reverting in \"+"
+         "(m?m+'m ':'')+sec+\"s</div>\";}"
+         "if(fxTouched)return;"
+         "document.getElementById('effect').value=f.name;"
+         "for(var i=0;i<5;i++){"
+         "var has=i<f.colors.length;"
+         "document.getElementById('u'+i).checked=has;"
+         "if(has)document.getElementById('c'+i).value=f.colors[i];"
+         "}"
+         "}"
+         "document.getElementById('applyfx').onclick=function(){"
+         "var colors=[];"
+         "for(var i=0;i<5;i++){"
+         "if(document.getElementById('u'+i).checked)colors.push(document.getElementById('c'+i).value);"
+         "}"
+         "if(!colors.length){alert('Pick at least one color.');return;}"
+         "post('/api/effect',{effect:document.getElementById('effect').value,colors:colors,"
+         "seconds:parseInt(document.getElementById('secs').value,10)})"
+         ".then(function(s){fxTouched=false;render(s);fxRender(s.effect);});"
+         "};"
+         "document.getElementById('resetfx').onclick=function(){"
+         "post('/api/effect/reset',{}).then(function(s){fxTouched=false;render(s);fxRender(s.effect);});"
+         "};"
+         "var installing=false;"
          "function esc(t){var d=document.createElement('div');d.textContent=t;return d.innerHTML;}"
          "function otaBox(o){"
          "var box=document.getElementById('otabox'),btn=document.getElementById('checkbtn');"
@@ -655,7 +968,7 @@ void LampSettings::handleSettingsGet() {
          "document.getElementById('checkbtn').textContent='Checking\\u2026';"
          "post('/api/ota/check',{}).catch(()=>{});};"
          "function u(){fetch('/api/status?pretty=0',{cache:'no-store'}).then(r=>r.json()).then(s=>{"
-         "render(s);otaBox(s.ota);"
+         "render(s);otaBox(s.ota);fxRender(s.effect);"
          "}).catch(()=>{});}"
          "setInterval(u,1000);u();"
          "</script>";
@@ -777,11 +1090,17 @@ void LampSettings::handleHelp() {
          "a second request.</p>";
 
     b += "<h2>Conventions</h2>";
-    b += "<p class='api'>Values may be sent as a JSON body, a form field, or a query "
-         "parameter &mdash; all three work on every endpoint. Anything that changes the "
-         "lamp is <b>POST</b> only, so nothing a browser can prefetch can switch a lamp "
-         "off or reflash it. There is no authentication: these lamps are LAN devices and "
-         "anything that can reach one can control it.</p>";
+    b += "<p class='api'>Values may be sent as a query parameter, a form field, or a "
+         "JSON body &mdash; but a JSON body is only read when the request sets "
+         "<code>Content-Type: application/json</code>. Curl's default content type is "
+         "form-encoded, and a JSON document sent that way is discarded by the HTTP "
+         "server before this firmware sees it, so <code>-d '{&quot;on&quot;:false}'</code> "
+         "alone sends nothing. Query parameters never have that problem.</p>";
+    b += "<p class='api'>Anything that changes the lamp is <b>POST</b> only, so nothing a "
+         "browser can prefetch can switch a lamp off or reflash it. A missing or "
+         "unreadable value is refused with a 400 rather than defaulted. There is no "
+         "authentication: these lamps are LAN devices and anything that can reach one can "
+         "control it.</p>";
 
     b += "<h2>Finding a lamp</h2>";
     b += "<p class='api'>Lamps announce <b>_" MDNS_SERVICE "._tcp</b> over mDNS on port 80. "
@@ -805,6 +1124,16 @@ void LampSettings::handleHelp() {
             "Blink white for a moment so you can tell which lamp this is. Overrides power "
             "and restores whatever was showing, so identifying a lamp that is off leaves "
             "it off. 1&ndash;60 seconds.");
+    b += ep("GET", "/api/effects", "",
+            "The four effects this firmware can render, with the color and duration "
+            "limits.");
+    b += ep("POST", "/api/effect",
+            "{\"effect\": \"blend\", \"colors\": [\"#ff0000\"], \"seconds\": 300}",
+            "Set the effect and up to five colors. <code>colors</code> may be omitted to "
+            "keep the current palette. <code>seconds</code> defaults to 300 and is capped "
+            "at 28800 (8 hours); 0 means until the lamp reboots. When it expires the lamp "
+            "returns to blending its five default colors.");
+    b += ep("POST", "/api/effect/reset", "", "Back to the default effect and palette now.");
     b += ep("POST", "/api/name", "{\"name\": \"Living Room\", \"hostname\": \"glow-lamp\"}",
             "Rename. <code>name</code> is free text and takes effect immediately; "
             "<code>hostname</code> is lowercase letters, digits and hyphens, and needs a "
@@ -824,16 +1153,21 @@ void LampSettings::handleHelp() {
     b += "<h2>Examples</h2>";
     b += "<pre><code># what is this lamp doing\n";
     b += "curl " + base + "/api/status\n\n";
-    b += "# off, on, and back to half brightness\n";
-    b += "curl -X POST " + base + "/api/power -d '{\"on\":false}'\n";
-    b += "curl -X POST " + base + "/api/power -d '{\"on\":true}'\n";
-    b += "curl -X POST " + base + "/api/brightness -d '{\"value\":128}'\n\n";
+    b += "# off, on, half brightness -- query parameters need no header\n";
+    b += "curl -X POST '" + base + "/api/power?on=false'\n";
+    b += "curl -X POST '" + base + "/api/power?on=true'\n";
+    b += "curl -X POST '" + base + "/api/brightness?value=128'\n\n";
     b += "# which one is this?\n";
-    b += "curl -X POST " + base + "/api/identify -d '{\"seconds\":4}'\n\n";
+    b += "curl -X POST '" + base + "/api/identify?seconds=4'\n\n";
+    b += "# an effect, with colors (the # may be left off in a URL)\n";
+    b += "curl -X POST '" + base + "/api/effect?effect=neon&colors=ff0000,00ff00,0000ff'\n\n";
+    b += "# a JSON body works, but ONLY with the content type set --\n";
+    b += "# curl's default is form-encoded, and this API cannot read that\n";
+    b += "curl -X POST -H 'Content-Type: application/json' \\\n";
+    b += "  -d '{\"effect\":\"blend\",\"colors\":[\"#ff0000\",\"#0000ff\"],\"seconds\":600}' \\\n";
+    b += "  " + base + "/api/effect\n\n";
     b += "# nightly: take a new release if there is one, do nothing if not\n";
-    b += "curl -X POST " + base + "/api/ota/update\n\n";
-    b += "# a query parameter works too, if quoting JSON is awkward\n";
-    b += "curl -X POST '" + base + "/api/power?on=toggle'</code></pre>";
+    b += "curl -X POST " + base + "/api/ota/update</code></pre>";
 
     b += "<h2>Status fields</h2>";
     b += "<table>";

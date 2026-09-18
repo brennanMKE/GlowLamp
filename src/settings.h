@@ -70,6 +70,9 @@ private:
     void handleApiPower();
     void handleApiBrightness();
     void handleApiIdentify();
+    void handleApiEffect();
+    void handleApiEffectReset();
+    void handleApiEffects();
     void handleApiName();
     void handleApiOtaCheck();
     void handleApiOtaInstall();

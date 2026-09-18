@@ -10,6 +10,8 @@
 
 #include <Arduino.h>
 
+#include "effects.h"
+
 // 0 is off, 255 is full -- Home Assistant's light convention, straight onto
 // FastLED.setBrightness(). Brightness is independent of power: turning the lamp
 // off and back on restores the brightness it had.
@@ -30,5 +32,39 @@ bool lampIdentifying();
 // The color the ring is showing right now, as "#rrggbb", before brightness
 // scaling. Reports the color the cycle is on even while the lamp is off.
 String lampColorHex();
+
+// ===== Effects =====
+//
+// An effect set here is deliberately temporary. It expires back to the default
+// -- blend, over the five built-in colors -- after `seconds`, and it does not
+// survive a reboot: nothing persists it, so a lamp that loses power comes back
+// showing what it is supposed to show rather than whatever someone was trying
+// last week.
+//
+// `seconds` of 0 means "until the lamp reboots", which is as permanent as an
+// effect gets here.
+
+// Colors arrive as 0xRRGGBB and are converted to hue and saturation for
+// rendering. Returns false if the mode is out of range or no colors were
+// given, in which case nothing changes.
+bool setLampEffect(uint8_t mode, const uint32_t *colors, uint8_t count, uint32_t seconds);
+
+// Back to blend over the built-in palette, immediately.
+void resetLampEffect();
+
+uint8_t lampEffectMode();
+const char *lampEffectName();
+
+// Fills `out` with up to MAX_COLORS colors as 0xRRGGBB and returns how many.
+// These are the colors as they were given, not the hue/saturation pair they
+// are rendered from, so a caller reading them back sees what it set.
+uint8_t lampEffectColors(uint32_t *out);
+
+// Seconds until this effect reverts: -1 when the default is running or the
+// effect was set to last until reboot.
+int32_t lampEffectExpiresIn();
+
+// True while the built-in default is what is showing.
+bool lampEffectIsDefault();
 
 #endif  // LAMP_H

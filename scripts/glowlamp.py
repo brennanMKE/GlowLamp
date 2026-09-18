@@ -139,6 +139,28 @@ class Lamp:
     def identify(self, seconds: int = 4) -> dict:
         return self._request("POST", "/api/identify", {"seconds": seconds})
 
+    def effects(self) -> dict:
+        """What this lamp's firmware can render, and its limits."""
+        return self._request("GET", "/api/effects")
+
+    def set_effect(self, effect: str, colors: list[str] | None = None,
+                   seconds: int = 300) -> dict:
+        """Set the effect and palette.
+
+        `colors` is up to five hex strings; None keeps whatever palette the
+        lamp is showing. `seconds` is how long before it reverts to the
+        default -- 0 means until the lamp reboots.
+        """
+        body: dict = {"effect": effect, "seconds": seconds}
+        if colors:
+            if len(colors) > 5:
+                raise LampError("at most 5 colors")
+            body["colors"] = colors
+        return self._request("POST", "/api/effect", body)
+
+    def reset_effect(self) -> dict:
+        return self._request("POST", "/api/effect/reset")
+
     def rename(self, name: str | None = None, hostname: str | None = None) -> dict:
         body = {}
         if name is not None:
@@ -354,10 +376,16 @@ def _targets(args) -> list[Lamp]:
 def _describe(status: dict) -> str:
     name = status.get("name") or status.get("hostname", "?")
     ota = status.get("ota", {})
+    fx = status.get("effect", {})
+    effect = fx.get("name", "?")
+    if fx and not fx.get("default", True):
+        left = fx.get("expires_in", -1)
+        effect += "*" if left < 0 else f"*{left}s"
     bits = [
         f"{name:<20}",
         f"{status.get('power', '?'):<3}",
         f"bright {status.get('brightness', '?'):>3}",
+        f"{effect:<12}",
         f"v{status.get('version', '?')}",
     ]
     if ota.get("available"):
@@ -399,6 +427,13 @@ def main(argv=None) -> int:
     p_id.add_argument("--seconds", type=int, default=4)
     # --set-name, not --name: --name already means "which lamp" on every
     # subcommand, and one flag cannot mean both which and what.
+    p_fx = add("effect", "set the effect and colors")
+    p_fx.add_argument("effect", choices=["blend", "loop", "flicker", "neon"])
+    p_fx.add_argument("--colors", help="up to 5, comma separated: '#ff0000,#0000ff'")
+    p_fx.add_argument("--seconds", type=int, default=300,
+                      help="revert after this long; 0 = until reboot (default 300)")
+    add("effects", "list the effects a lamp supports")
+    add("default", "back to the default effect and palette")
     p_name = add("rename", "set the lamp name and/or hostname")
     p_name.add_argument("--set-name", dest="new_name", help="the free-text lamp name")
     p_name.add_argument("--set-hostname", dest="new_hostname", help="the mDNS label")
@@ -439,6 +474,13 @@ def main(argv=None) -> int:
                 result = lamp.brightness(args.value)
             elif args.command == "identify":
                 result = lamp.identify(args.seconds)
+            elif args.command == "effect":
+                colors = [c.strip() for c in args.colors.split(",")] if args.colors else None
+                result = lamp.set_effect(args.effect, colors, args.seconds)
+            elif args.command == "effects":
+                result = lamp.effects()
+            elif args.command == "default":
+                result = lamp.reset_effect()
             elif args.command == "rename":
                 result = lamp.rename(args.new_name, args.new_hostname)
             elif args.command == "reboot":
@@ -458,6 +500,14 @@ def main(argv=None) -> int:
                 raise LampError(f"unknown command {args.command}")
 
             results.append(result)
+
+        if args.command == "effects":
+            for result in results:
+                for e in result.get("effects", []):
+                    print(f"{e['name']:<10} {e['description']}")
+                print(f"up to {result.get('max_colors')} colors, "
+                      f"{result.get('max_seconds')}s maximum")
+            return 0
 
         if args.json:
             print(json.dumps(results if len(results) > 1 else results[0], indent=2))

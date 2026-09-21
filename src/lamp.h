@@ -29,6 +29,26 @@ bool lampPower();
 void identifyLamp(uint32_t durationMs);
 bool lampIdentifying();
 
+// ===== Alert =====
+//
+// A red pulse loud enough to be noticed from across a room, for Home Assistant
+// to fire at something that needs a person: a door left open, a cycle finished,
+// a sensor that has gone quiet.
+//
+// It is an overlay, not an effect. It overrides the running effect, the
+// brightness setting and the power state -- an alert nobody can see because the
+// lamp was switched off or dimmed to 5 is not an alert -- and when it ends the
+// lamp goes back to exactly what it was doing, including being off.
+//
+// It always expires. An alert that stays on forever stops being an alert, and a
+// lamp stuck red because a broker went down is worse than no alert at all.
+void triggerLampAlert(uint32_t seconds);
+void clearLampAlert();
+bool lampAlerting();
+
+// Seconds left, or -1 when no alert is running.
+int32_t lampAlertRemaining();
+
 // The color the ring is showing right now, as "#rrggbb", before brightness
 // scaling. Reports the color the cycle is on even while the lamp is off.
 String lampColorHex();

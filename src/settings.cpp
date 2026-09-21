@@ -151,6 +151,8 @@ void LampSettings::registerRoutes() {
     server.on("/api/power", HTTP_POST, std::bind(&LampSettings::handleApiPower, this));
     server.on("/api/brightness", HTTP_POST, std::bind(&LampSettings::handleApiBrightness, this));
     server.on("/api/identify", HTTP_POST, std::bind(&LampSettings::handleApiIdentify, this));
+    server.on("/api/alert", HTTP_POST, std::bind(&LampSettings::handleApiAlert, this));
+    server.on("/api/alert/clear", HTTP_POST, std::bind(&LampSettings::handleApiAlertClear, this));
     server.on("/api/effects", HTTP_GET, std::bind(&LampSettings::handleApiEffects, this));
     server.on("/api/effect", HTTP_POST, std::bind(&LampSettings::handleApiEffect, this));
     server.on("/api/effect/reset", HTTP_POST, std::bind(&LampSettings::handleApiEffectReset, this));
@@ -266,6 +268,10 @@ String LampSettings::statusJson(bool pretty) const {
     doc["color"] = lampColorHex();
     doc["identifying"] = lampIdentifying();
 
+    JsonObject alert = doc["alert"].to<JsonObject>();
+    alert["active"] = lampAlerting();
+    alert["remaining"] = lampAlertRemaining();
+
     JsonObject effect = doc["effect"].to<JsonObject>();
     effect["name"] = lampEffectName();
     effect["default"] = lampEffectIsDefault();
@@ -378,6 +384,10 @@ void LampSettings::handleApiIndex() {
     add("POST", "/api/power", "{\"on\": true | false | \"toggle\"}", "Switch the lamp on or off. Persists.");
     add("POST", "/api/brightness", "{\"value\": 0-255}", "Set brightness. Persists. Does not switch the lamp on.");
     add("POST", "/api/identify", "{\"seconds\": 1-60}", "Blink white so you can find this lamp.");
+    add("POST", "/api/alert", "{\"seconds\": 30}",
+        "Pulse red to get attention. Overrides the effect, the brightness and the power "
+        "state, then restores them. Always expires.");
+    add("POST", "/api/alert/clear", "", "Stop an alert now.");
     add("GET", "/api/effects", "", "The effects this firmware can render, and the limits.");
     add("POST", "/api/effect",
         "{\"effect\": \"blend\", \"colors\": [\"#ff0000\"], \"seconds\": 300}",
@@ -612,6 +622,31 @@ void LampSettings::handleApiEffect() {
 void LampSettings::handleApiEffectReset() {
     ESP_LOGI(TAG, "effect reset to the default");
     resetLampEffect();
+    sendStatus();
+}
+
+// REST parity with the MQTT topic, so an alert can be fired and cleared with no
+// broker involved -- which is how it gets tested, and how it gets fired from a
+// laptop when the broker is the thing that has gone wrong.
+void LampSettings::handleApiAlert() {
+    Params p(configServer.getServer());
+    uint32_t seconds = 0;  // 0 means the firmware's default
+    if (p.has("seconds")) {
+        long v = p.num("seconds", 0);
+        if (v <= 0) {
+            clearLampAlert();
+            sendStatus();
+            return;
+        }
+        seconds = (uint32_t)v;
+    }
+    triggerLampAlert(seconds);
+    ESP_LOGI(TAG, "alert requested over HTTP");
+    sendStatus();
+}
+
+void LampSettings::handleApiAlertClear() {
+    clearLampAlert();
     sendStatus();
 }
 
@@ -1381,6 +1416,13 @@ void LampSettings::handleHelp() {
             "at 28800 (8 hours); 0 means until the lamp reboots. When it expires the lamp "
             "returns to blending its five default colors.");
     b += ep("POST", "/api/effect/reset", "", "Back to the default effect and palette now.");
+    b += ep("POST", "/api/alert", "{\"seconds\": 30}",
+            "Pulse red until it expires, to get the attention of anyone in the room. "
+            "Overrides the running effect, the brightness setting <em>and</em> the power "
+            "state &mdash; a lamp that is switched off is exactly the one an alert needs "
+            "to reach &mdash; then puts all three back. Defaults to 30 s, capped at one "
+            "hour; it always expires, because a lamp stuck red is worse than no alert.");
+    b += ep("POST", "/api/alert/clear", "", "Stop an alert now.");
     b += ep("POST", "/api/name", "{\"name\": \"Living Room\", \"hostname\": \"glow-lamp\"}",
             "Rename. <code>name</code> is free text and takes effect immediately; "
             "<code>hostname</code> is lowercase letters, digits and hyphens and becomes "
@@ -1430,6 +1472,12 @@ void LampSettings::handleHelp() {
          "<b>glowlamp/&lt;hostname&gt;/state</b>, and carries a last will on "
          "<b>glowlamp/&lt;hostname&gt;/availability</b> so the entity goes unavailable when "
          "the lamp drops off.</p>";
+    b += "<p class='api'>An alert is fired by publishing to "
+         "<b>glowlamp/&lt;hostname&gt;/alert</b>, or to <b>glowlamp/all/alert</b> to reach "
+         "every lamp with one publish. The payload may be <code>{\"seconds\": 30}</code>, "
+         "a bare number, or <code>off</code> to clear one; an empty message uses the "
+         "default. The lamp reports it on <b>glowlamp/&lt;hostname&gt;/alert/state</b> as "
+         "<code>on</code> or <code>off</code>, unretained, for a binary sensor.</p>";
     b += "<p class='api'>Anything set over MQTT has no expiry: Home Assistant is a "
          "controller, and an effect that reverted after five minutes would leave the entity "
          "showing a state the lamp no longer has. MQTT is optional &mdash; a lamp with no "

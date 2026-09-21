@@ -29,6 +29,10 @@ static uint32_t retryAt = 0;
 // the address is wrong, the credentials are, or the broker simply is not there.
 static int lastRc = 0;
 
+// So the alert's own state topic is published on the edges rather than every
+// pass through the loop.
+static bool lastAlerting = false;
+
 static bool lastPower = false;
 static uint8_t lastBrightness = 0;
 static String lastEffect;
@@ -50,6 +54,14 @@ static String baseTopic() { return "glowlamp/" + settings.hostName(); }
 static String stateTopic() { return baseTopic() + "/state"; }
 static String commandTopic() { return baseTopic() + "/set"; }
 static String availabilityTopic() { return baseTopic() + "/availability"; }
+static String alertTopic() { return baseTopic() + "/alert"; }
+static String alertStateTopic() { return baseTopic() + "/alert/state"; }
+
+// One publish that reaches every lamp. Home Assistant firing an alert almost
+// never means "that lamp" -- it means "whoever is in the building" -- and a
+// broadcast keeps an automation from having to name each lamp and be edited
+// when a third one arrives.
+static const char *ALERT_ALL_TOPIC = "glowlamp/all/alert";
 
 bool mqttEnabled() { return settings.mqttHost().length() > 0; }
 bool mqttConnected() { return mqtt.connected(); }
@@ -141,6 +153,20 @@ static void publishState(bool force = false) {
     everPublished = true;
 }
 
+// Separate from the light's state, because an alert is not a property of the
+// light -- it is something happening to it, and Home Assistant reads this as a
+// binary sensor rather than as part of the entity.
+//
+// Not retained: a retained "on" would come back after a broker restart and
+// describe an alert that finished hours ago.
+static void publishAlertState(bool force = false) {
+    if (!mqtt.connected()) return;
+    bool now = lampAlerting();
+    if (!force && now == lastAlerting) return;
+    mqtt.publish(alertStateTopic().c_str(), now ? "on" : "off", false);
+    lastAlerting = now;
+}
+
 // The retained discovery config that makes the lamp an entity on its own. Keyed
 // by unique_id, so republishing after a rename updates the existing entity
 // instead of leaving a duplicate behind.
@@ -193,6 +219,39 @@ static void onMessage(char *topic, byte *payload, unsigned int length) {
     msg.reserve(length);
     for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
     ESP_LOGI(TAG, "%s: %s", topic, msg.c_str());
+
+    String t(topic);
+    if (t.endsWith("/alert")) {
+        // Deliberately forgiving about the payload. An alert is fired from an
+        // automation in a hurry, and the difference between {"seconds":30} and
+        // an empty message should not decide whether anyone is warned.
+        String body = msg;
+        body.trim();
+        body.toLowerCase();
+
+        if (body == "off" || body == "clear" || body == "0" || body.indexOf("\"off\"") >= 0) {
+            clearLampAlert();
+        } else {
+            uint32_t seconds = 0;  // 0 means "the default", decided in lamp.cpp
+            JsonDocument alertDoc;
+            if (!deserializeJson(alertDoc, msg) && alertDoc["seconds"].is<long>()) {
+                long v = alertDoc["seconds"].as<long>();
+                if (v <= 0) {
+                    clearLampAlert();
+                    publishState(true);
+                    return;
+                }
+                seconds = (uint32_t)v;
+            } else if (body.length() && body.toInt() > 0) {
+                // A bare number, for an automation that would rather not build
+                // JSON: `mqtt.publish` with payload "60".
+                seconds = (uint32_t)body.toInt();
+            }
+            triggerLampAlert(seconds);
+        }
+        publishState(true);
+        return;
+    }
 
     JsonDocument doc;
     if (deserializeJson(doc, msg)) {
@@ -259,6 +318,7 @@ void loopMqtt() {
     if (mqtt.connected()) {
         mqtt.loop();
         publishState();
+        publishAlertState();
         return;
     }
 
@@ -308,8 +368,12 @@ void loopMqtt() {
     ESP_LOGI(TAG, "connected");
     mqtt.publish(avail.c_str(), "online", true);
     mqtt.subscribe(commandTopic().c_str());
-    ESP_LOGI(TAG, "subscribed to %s", commandTopic().c_str());
+    mqtt.subscribe(alertTopic().c_str());
+    mqtt.subscribe(ALERT_ALL_TOPIC);
+    ESP_LOGI(TAG, "subscribed to %s, %s and %s", commandTopic().c_str(), alertTopic().c_str(),
+             ALERT_ALL_TOPIC);
 
     publishDiscovery();
     publishState(true);
+    publishAlertState(true);
 }

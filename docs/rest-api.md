@@ -45,6 +45,8 @@ one can control it.
 | POST | `/api/power` | `{"on": true \| false \| "toggle"}` |
 | POST | `/api/brightness` | `{"value": 0-255}` |
 | POST | `/api/identify` | `{"seconds": 1-60}` |
+| POST | `/api/alert` | `{"seconds": 30}` |
+| POST | `/api/alert/clear` | — |
 | GET | `/api/effects` | — |
 | POST | `/api/effect` | `{"effect": "...", "colors": [...], "seconds": 300}` |
 | POST | `/api/effect/reset` | — |
@@ -71,6 +73,22 @@ off changes what it comes back on at.
 Blinks the ring white for a few seconds at a floor brightness of 160, so a lamp
 dimmed to 5 still announces itself. Overrides power and the effect, and restores
 whatever was showing — identifying a lamp that is off leaves it off.
+
+### Alert
+
+```sh
+curl -X POST 'http://lamp.local/api/alert?seconds=30'
+curl -X POST http://lamp.local/api/alert/clear
+```
+
+A red pulse to get attention. Overrides the running effect, the brightness
+setting and the power state — a lamp that is switched off is exactly the one an
+alert needs to reach — then restores all three. Defaults to 30 s, capped at one
+hour, and always expires.
+
+This is the REST twin of the MQTT alert topic, which is how Home Assistant fires
+one; see [mqtt.md](mqtt.md). It exists so an alert can be tested and fired with
+no broker involved, including when the broker is the thing that has gone wrong.
 
 ### Effects
 

@@ -127,6 +127,18 @@ parameters never have that problem, which is why they lead here.
 describes the firmware actually running, and `/api` is that as JSON for an agent
 that would rather not read HTML.
 
+### Alerts
+
+```sh
+mosquitto_pub -h broker -t glowlamp/all/alert -m '{"seconds": 30}'
+./scripts/glowlamp.py alert --all --seconds 30
+curl -X POST 'http://castor-lamp.local/api/alert?seconds=30'
+```
+
+A red pulse to get attention, for Home Assistant to fire at something that needs
+a person. It overrides the effect, the brightness and the power state, then puts
+all three back, and always expires. See [docs/mqtt.md](docs/mqtt.md#subscribe-glowlamphostnamealert-and-glowlampallalert).
+
 ### Effects
 
 ```sh

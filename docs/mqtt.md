@@ -52,6 +52,9 @@ with no separators.
 | `glowlamp/<hostname>/state` | publish | **yes** | Current state |
 | `glowlamp/<hostname>/availability` | publish | **yes** | `online` / `offline` |
 | `glowlamp/<hostname>/set` | **subscribe** | **never** | Command |
+| `glowlamp/<hostname>/alert` | **subscribe** | **never** | Fire or clear an alert |
+| `glowlamp/all/alert` | **subscribe** | **never** | The same, to every lamp at once |
+| `glowlamp/<hostname>/alert/state` | publish | no | `on` / `off` while an alert runs |
 
 **Never retain a command.** A retained command replays on every reconnect, which
 pins the lamp to whatever was last sent and makes it impossible to control from
@@ -113,6 +116,63 @@ debug — it is the single most common mistake with the JSON light schema.
 parameters (speed, intensity, multi-color palettes). A palette of up to five
 colors is a REST-only feature; Home Assistant's light entity has one color
 picker, so MQTT sets one color. See [rest-api.md](rest-api.md#effects).
+
+## Subscribe: `glowlamp/<hostname>/alert` and `glowlamp/all/alert`
+
+A red pulse loud enough to be noticed from across a room, for firing at
+something that needs a person: a door left open, a cycle finished, a sensor gone
+quiet.
+
+```sh
+mosquitto_pub -h broker -t glowlamp/all/alert -m '{"seconds": 30}'
+mosquitto_pub -h broker -t glowlamp/all/alert -m '60'        # a bare number works
+mosquitto_pub -h broker -t glowlamp/all/alert -m ''          # empty: the 30s default
+mosquitto_pub -h broker -t glowlamp/all/alert -m 'off'       # clear it now
+```
+
+The payload is deliberately forgiving. An alert is fired from an automation in a
+hurry, and the difference between `{"seconds":30}` and an empty message should
+not decide whether anyone is warned.
+
+**`glowlamp/all/alert` reaches every lamp with one publish.** Firing an alert
+almost never means "that lamp" — it means "whoever is in the building" — and a
+broadcast keeps an automation from naming each lamp and being edited when a
+third one arrives.
+
+### What an alert overrides
+
+An alert is an overlay, not an effect. It overrides:
+
+* the running **effect**,
+* the **brightness** setting — it runs at full, because an alert nobody can see
+  at brightness 5 is not an alert,
+* the **power state** — a lamp switched off is exactly the one an alert needs to
+  reach.
+
+When it ends, all three go back to exactly what they were, including being off.
+
+**It always expires.** 30 seconds by default, one hour at the ceiling. An alert
+that stays on forever stops being an alert, and a lamp stuck red because a
+broker went down is worse than no alert at all.
+
+Identify wins over an alert, because someone standing at the lamp pressing
+identify can see the alert on it either way.
+
+### Reading alert state
+
+`glowlamp/<hostname>/alert/state` carries `on` or `off`, for a binary sensor:
+
+```yaml
+mqtt:
+  binary_sensor:
+    - name: Castor alerting
+      state_topic: glowlamp/castor-lamp/alert/state
+      payload_on: "on"
+      payload_off: "off"
+```
+
+It is **not retained**: a retained `on` would come back after a broker restart
+and describe an alert that finished hours ago.
 
 ## Publish: `glowlamp/<hostname>/state`
 

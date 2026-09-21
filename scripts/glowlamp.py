@@ -136,6 +136,13 @@ class Lamp:
             raise LampError("brightness must be between 0 and 255")
         return self._request("POST", "/api/brightness", {"value": value})
 
+    def alert(self, seconds: int = 30) -> dict:
+        """Pulse red until it expires. Overrides effect, brightness and power."""
+        return self._request("POST", "/api/alert", {"seconds": seconds})
+
+    def clear_alert(self) -> dict:
+        return self._request("POST", "/api/alert/clear")
+
     def identify(self, seconds: int = 4) -> dict:
         return self._request("POST", "/api/identify", {"seconds": seconds})
 
@@ -425,6 +432,7 @@ def _describe(status: dict) -> str:
     name = status.get("name") or status.get("hostname", "?")
     ota = status.get("ota", {})
     mq = status.get("mqtt", {})
+    al = status.get("alert", {})
     fx = status.get("effect", {})
     effect = fx.get("name", "?")
     if fx and not fx.get("default", True):
@@ -439,6 +447,8 @@ def _describe(status: dict) -> str:
     ]
     if mq.get("enabled"):
         bits.append("mqtt" if mq.get("connected") else "mqtt!")
+    if al.get("active"):
+        bits.append(f"ALERT {al.get('remaining')}s")
     if ota.get("available"):
         bits.append(f"-> v{ota.get('latest')} available")
     return "  ".join(bits)
@@ -476,6 +486,9 @@ def main(argv=None) -> int:
     p_bright.add_argument("value", type=int)
     p_id = add("identify", "blink white to find a lamp")
     p_id.add_argument("--seconds", type=int, default=4)
+    p_alert = add("alert", "pulse red to get attention")
+    p_alert.add_argument("--seconds", type=int, default=30)
+    p_alert.add_argument("--off", action="store_true", help="stop an alert now")
     # --set-name, not --name: --name already means "which lamp" on every
     # subcommand, and one flag cannot mean both which and what.
     p_fx = add("effect", "set the effect and colors")
@@ -556,6 +569,8 @@ def main(argv=None) -> int:
                 result = lamp.brightness(args.value)
             elif args.command == "identify":
                 result = lamp.identify(args.seconds)
+            elif args.command == "alert":
+                result = lamp.clear_alert() if args.off else lamp.alert(args.seconds)
             elif args.command == "effect":
                 colors = [c.strip() for c in args.colors.split(",")] if args.colors else None
                 result = lamp.set_effect(args.effect, colors, args.seconds)

@@ -212,6 +212,27 @@ MQTT is optional and off by default. A lamp with no broker never connects and is
 fully usable over REST, which stays the interface for the scripts, identify and
 OTA.
 
+== Alerts ==
+
+A red pulse loud enough to be noticed from across a room, for Home Assistant to
+fire at something that needs a person.
+
+<syntaxhighlight lang="bash">
+mosquitto_pub -h broker -t glowlamp/all/alert -m '{"seconds": 30}'   # every lamp
+mosquitto_pub -h broker -t glowlamp/all/alert -m 'off'               # clear
+curl -X POST 'http://castor-lamp.local/api/alert?seconds=30'         # one lamp, no broker
+./scripts/glowlamp.py alert --all --seconds 30
+</syntaxhighlight>
+
+An alert overrides the running effect, the brightness setting '''and''' the power
+state &mdash; a lamp switched off is exactly the one an alert needs to reach
+&mdash; then puts all three back. It always expires: 30 seconds by default, one
+hour at the ceiling.
+
+<code>glowlamp/all/alert</code> reaches every lamp with one publish, so an automation
+does not name each lamp and need editing when a third one arrives. Each lamp
+reports on <code>glowlamp/<hostname>/alert/state</code> for a binary sensor.
+
 == Home Assistant automations ==
 
 Point a lamp at the broker and its entity appears on its own. Nothing is added to
@@ -437,4 +458,6 @@ secrets in it.
 | 0.0.5 || Four effects, five-color palette, hue-based blending, bare hostnames, MQTT
 |-
 | 0.0.6 || <code>/effects</code> page with presets, favicon, steady neon, MQTT failure reporting
+|-
+| 0.0.7 || Alerts over MQTT and REST, including a broadcast topic
 |}

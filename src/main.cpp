@@ -74,6 +74,21 @@ static const uint32_t IDENTIFY_BLINK_MS = 150;
 // announces itself. Restored to the configured value when the flash ends.
 static const uint8_t IDENTIFY_MIN_BRIGHTNESS = 160;
 
+// ===== Alert =====
+// Full brightness, not a floor: an alert is the one thing that overrides what
+// someone chose, because the whole point is that it cannot be missed.
+static const uint8_t ALERT_BRIGHTNESS = 255;
+
+// One pulse. Fast enough to read as urgent, slow enough not to strobe -- this
+// is a beacon, not a stutter, and it swings between a dim ember and full red
+// rather than blinking on and off.
+static const uint32_t ALERT_PULSE_MS = 650;
+static const uint8_t ALERT_FLOOR = 40;
+
+// Default and ceiling for how long one runs.
+static const uint32_t ALERT_DEFAULT_S = 30;
+static const uint32_t ALERT_MAX_S = 3600;
+
 CRGB leds[NUM_LEDS];
 
 // ===== State =====
@@ -84,6 +99,21 @@ static CRGB currentColor = CRGB::Black;
 static bool identifying = false;
 static uint32_t identifyStart = 0;
 static uint32_t identifyEnd = 0;
+
+static bool alerting = false;
+static uint32_t alertStart = 0;
+static uint32_t alertEnd = 0;
+
+// What was last handed to FastLED. Identify and alert both override the
+// configured brightness, so the value actually applied is decided in one place
+// each frame rather than by whichever of them last called setBrightness().
+//
+// Initialised to 255, which is FastLED's own power-on default, NOT to 0: this
+// is compared against the wanted value to decide whether to call setBrightness
+// at all, so it has to start out describing what FastLED is actually doing. At
+// 0 it would claim the strip was already dark, and a lamp whose stored
+// brightness is 0 would come back from a reboot at full blast.
+static uint8_t appliedBrightness = 255;
 
 static EffectState fx;
 static uint8_t effectMode = EFFECT_BLEND;
@@ -113,10 +143,10 @@ const char *lampEffectName() { return EFFECT_NAMES[effectMode]; }
 bool lampEffectIsDefault() { return effectIsDefault; }
 
 void setLampBrightness(uint8_t value) {
+    // Only ever records the setting. What reaches FastLED is decided in
+    // loopLeds(), which runs every 16 ms -- so a slider change still looks
+    // instant, and an overlay in progress is not dimmed out from under itself.
     brightness = value;
-    // Not applied while identifying: the flash owns the brightness until it
-    // ends, and would otherwise be dimmed mid-blink by a slider change.
-    if (!identifying) FastLED.setBrightness(brightness);
 }
 
 void setLampPower(bool on) { power = on; }
@@ -125,7 +155,30 @@ void identifyLamp(uint32_t durationMs) {
     identifyStart = millis();
     identifyEnd = identifyStart + durationMs;
     identifying = true;
-    FastLED.setBrightness(max(brightness, IDENTIFY_MIN_BRIGHTNESS));
+}
+
+bool lampAlerting() { return alerting; }
+
+void triggerLampAlert(uint32_t seconds) {
+    if (seconds == 0) seconds = ALERT_DEFAULT_S;
+    if (seconds > ALERT_MAX_S) seconds = ALERT_MAX_S;
+    alertStart = millis();
+    alertEnd = alertStart + seconds * 1000UL;
+    alerting = true;
+    ESP_LOGI(TAG, "alert for %lus", (unsigned long)seconds);
+}
+
+void clearLampAlert() {
+    if (!alerting) return;
+    alerting = false;
+    ESP_LOGI(TAG, "alert cleared");
+}
+
+int32_t lampAlertRemaining() {
+    if (!alerting) return -1;
+    uint32_t now = millis();
+    if (timeReached(now, alertEnd)) return 0;
+    return (int32_t)((alertEnd - now) / 1000);
 }
 
 String lampColorHex() {
@@ -276,19 +329,45 @@ static void loopLeds() {
     // the ring is actually showing, whichever effect drew it.
     currentColor = leds[0];
 
+    // Expire the overlays. timeReached() rather than a plain compare: an
+    // absolute deadline test strands them for 49.7 days if the loop blocks
+    // across the millis() rollover. See include/every_n_millis.h.
+    if (identifying && timeReached(now, identifyEnd)) identifying = false;
+    if (alerting && timeReached(now, alertEnd)) {
+        alerting = false;
+        ESP_LOGI(TAG, "alert over");
+    }
+
+    // One decision about brightness per frame, made here rather than by
+    // whichever overlay started last. Both of them override what someone chose,
+    // and they can overlap.
+    uint8_t want = brightness;
+    if (identifying && want < IDENTIFY_MIN_BRIGHTNESS) want = IDENTIFY_MIN_BRIGHTNESS;
+    if (alerting) want = ALERT_BRIGHTNESS;
+    if (want != appliedBrightness) {
+        FastLED.setBrightness(want);
+        appliedBrightness = want;
+    }
+
+    // Identify wins over an alert: someone is standing at the lamp asking which
+    // one this is, and they can see the alert on it either way.
     if (identifying) {
-        // timeReached() rather than a plain compare, and elapsed rather than an
-        // absolute deadline: both survive the millis() rollover. See
-        // include/every_n_millis.h.
-        if (timeReached(now, identifyEnd)) {
-            identifying = false;
-            FastLED.setBrightness(brightness);
-        } else {
-            bool lit = ((now - identifyStart) / IDENTIFY_BLINK_MS) % 2 == 0;
-            fill_solid(leds, NUM_LEDS, lit ? CRGB::White : CRGB::Black);
-            FastLED.show();
-            return;
-        }
+        bool lit = ((now - identifyStart) / IDENTIFY_BLINK_MS) % 2 == 0;
+        fill_solid(leds, NUM_LEDS, lit ? CRGB::White : CRGB::Black);
+        FastLED.show();
+        return;
+    }
+
+    // An alert ignores power as well as the effect. A lamp switched off is
+    // exactly the lamp an alert most needs to reach, and the power state is
+    // untouched underneath -- when this ends, it goes back to being off.
+    if (alerting) {
+        uint32_t into = (now - alertStart) % ALERT_PULSE_MS;
+        uint8_t wave = triwave8((uint8_t)((into * 255UL) / ALERT_PULSE_MS));
+        uint8_t value = ALERT_FLOOR + (uint8_t)(((uint16_t)wave * (255 - ALERT_FLOOR)) / 255);
+        fill_solid(leds, NUM_LEDS, CHSV(0, 255, value));
+        FastLED.show();
+        return;
     }
 
     if (!power) fill_solid(leds, NUM_LEDS, CRGB::Black);

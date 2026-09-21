@@ -83,6 +83,8 @@ private:
     void handleApiPower();
     void handleApiBrightness();
     void handleApiIdentify();
+    void handleApiAlert();
+    void handleApiAlertClear();
     void handleApiEffect();
     void handleApiEffectReset();
     void handleApiEffects();

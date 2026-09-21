@@ -9,6 +9,7 @@
 #include "effects.h"
 #include "favicon.h"
 #include "lamp.h"
+#include "logbuf.h"
 #include "mqtt.h"
 #include "ota.h"
 #include "version.h"
@@ -124,6 +125,8 @@ void LampSettings::registerRoutes() {
     server.on("/settings", HTTP_GET, std::bind(&LampSettings::handleSettingsGet, this));
     server.on("/settings", HTTP_POST, std::bind(&LampSettings::handleSettingsSave, this));
     server.on("/help", HTTP_GET, std::bind(&LampSettings::handleHelp, this));
+    server.on("/logs", HTTP_GET, std::bind(&LampSettings::handleLogPage, this));
+    server.on("/api/log", HTTP_GET, std::bind(&LampSettings::handleApiLog, this));
 
     // Browsers ask for /favicon.ico on their own, whatever the page links to,
     // and EasyWiFi's pages are served from here too -- so registering the route
@@ -329,6 +332,18 @@ String LampSettings::statusJson(bool pretty) const {
 
     doc["uptime"] = millis() / 1000;
 
+    // Enough to tell a lamp that is behaving from one that is not, without
+    // anyone having to carry it to a desk and a USB cable.
+    JsonObject diag = doc["diagnostics"].to<JsonObject>();
+    // Empty when the ring is lit. This is the field that would have answered
+    // "it is plugged in and dark" in one request.
+    diag["dark_because"] = lampDarkReason();
+    diag["effect_color"] = lampEffectColorHex();
+    diag["reset_reason"] = lastResetReason();
+    diag["free_heap"] = ESP.getFreeHeap();
+    diag["min_free_heap"] = ESP.getMinFreeHeap();
+    diag["log"] = "/api/log";
+
     String out;
     if (pretty) {
         serializeJsonPretty(doc, out);
@@ -399,6 +414,7 @@ void LampSettings::handleApiIndex() {
     add("POST", "/api/ota/install", "", "Install the latest release, then reboot.");
     add("POST", "/api/ota/update", "",
         "Check, and install only if the release differs. Safe to call on a schedule.");
+    add("GET", "/api/log", "", "The last few KB of the device log, as plain text.");
     add("POST", "/api/reboot", "", "Reboot the lamp.");
 
     doc["notes"]["responses"] =
@@ -628,6 +644,14 @@ void LampSettings::handleApiEffectReset() {
 // REST parity with the MQTT topic, so an alert can be fired and cleared with no
 // broker involved -- which is how it gets tested, and how it gets fired from a
 // laptop when the broker is the thing that has gone wrong.
+// Plain text, not JSON: this is read by a person or piped into grep, and
+// wrapping a log in JSON only adds escaping between them and it.
+void LampSettings::handleApiLog() {
+    WebServer &server = configServer.getServer();
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(200, "text/plain", logBufferContents());
+}
+
 void LampSettings::handleApiAlert() {
     Params p(configServer.getServer());
     uint32_t seconds = 0;  // 0 means the firmware's default
@@ -883,12 +907,60 @@ static String controlsJs() {
         "}");
 }
 
+void LampSettings::handleLogPage() {
+    String b;
+
+    const char *dark = lampDarkReason();
+    if (dark[0]) {
+        b += "<div class='status warning'>The ring is dark: ";
+        b += dark;
+        b += ".</div>";
+    } else {
+        b += "<div class='status success'>The ring is lit.</div>";
+    }
+
+    b += "<h2>Device</h2>";
+    b += "<table>";
+    b += row("Firmware", FIRMWARE_VERSION);
+    b += row("Uptime", String(millis() / 1000) + " s");
+    b += row("Last reset", lastResetReason());
+    b += row("Free heap", String(ESP.getFreeHeap()) + " bytes");
+    b += row("Lowest heap", String(ESP.getMinFreeHeap()) + " bytes");
+    b += row("Showing", lampColorHex() + " (effect on " + lampEffectColorHex() + ")");
+    b += "</table>";
+
+    b += "<h2>Log</h2>";
+    b += "<p style='font-size:14px;color:#888'>The most recent few KB, oldest first. The "
+         "serial console still gets everything.</p>";
+    b += "<pre id='log' style='max-height:60vh;overflow:auto;font-size:12px'>loading&hellip;</pre>";
+
+    b += "<div class='button-group'>";
+    b += "<a href='/' class='button'>Home</a>";
+    b += "<a href='/settings' class='button'>Settings</a>";
+    b += "<a href='/api/log' class='button'>Raw</a>";
+    b += "</div>";
+
+    // Scrolled to the bottom on each refresh unless the reader has scrolled up,
+    // which is the difference between a log that follows and one that fights.
+    b += "<script>"
+         "var el=document.getElementById('log');"
+         "function u(){fetch('/api/log',{cache:'no-store'}).then(r=>r.text()).then(t=>{"
+         "var atEnd=el.scrollTop+el.clientHeight>=el.scrollHeight-20;"
+         "el.textContent=t;"
+         "if(atEnd)el.scrollTop=el.scrollHeight;"
+         "}).catch(()=>{});}"
+         "setInterval(u,2000);u();"
+         "</script>";
+
+    configServer.getServer().send(200, "text/html", page("Diagnostics", b));
+}
+
 void LampSettings::handleHome() {
     WebServer &server = configServer.getServer();
     bool online = WiFi.status() == WL_CONNECTED;
 
     String b;
-    b += "<p>A ring of 8 LEDs blending between three vibrant colors.</p>";
+    b += "<div id='dark'></div>";
 
     b += controlsHtml();
 
@@ -924,6 +996,7 @@ void LampSettings::handleHome() {
     b += "</div>";
     b += "<div class='button-group'>";
     b += "<a href='/help' class='button'>API</a>";
+    b += "<a href='/logs' class='button'>Diagnostics</a>";
     b += "<a href='/wifi' class='button'>WiFi Setup</a>";
     b += "</div>";
 
@@ -936,6 +1009,10 @@ void LampSettings::handleHome() {
          "document.getElementById('color').textContent=s.color;"
          "document.getElementById('swatch').style.background=s.color;"
          "document.getElementById('state').textContent=s.power;"
+         "var dk=document.getElementById('dark');"
+         "dk.innerHTML=s.diagnostics.dark_because"
+         "?\"<div class='status warning'>The ring is dark: \"+s.diagnostics.dark_because+"
+         "\".</div>\":'';"
          "document.getElementById('effect').textContent="
          "s.effect.name+(s.effect.default?'':' (reverting)');"
          "document.getElementById('mqtt').textContent="
@@ -1442,6 +1519,10 @@ void LampSettings::handleHelp() {
             "{\"host\": \"192.168.1.10\", \"port\": 1883, \"user\": \"\", \"pass\": \"\"}",
             "Set the MQTT broker. An empty host turns MQTT off. An empty password leaves "
             "the stored one alone. Takes effect without a reboot.");
+    b += ep("GET", "/api/log", "",
+            "The last few KB of the device log as plain text, oldest first. The same thing "
+            "with a page around it is at <code>/logs</code>, which also reports the reset "
+            "reason, free heap, and why the ring is dark if it is.");
     b += ep("POST", "/api/reboot", "", "Reboot the lamp.");
 
     b += "<h2>Examples</h2>";

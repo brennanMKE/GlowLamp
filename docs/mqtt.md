@@ -158,6 +158,66 @@ broker went down is worse than no alert at all.
 Identify wins over an alert, because someone standing at the lamp pressing
 identify can see the alert on it either way.
 
+### From Home Assistant
+
+`mqtt.publish` already exists wherever the MQTT integration is set up, so an
+alert needs no `rest_command`, no YAML-only integration, and no restart:
+
+```yaml
+script:
+  alert_lamps:
+    alias: Flash the lamps red
+    sequence:
+      - action: mqtt.publish
+        data:
+          topic: glowlamp/all/alert
+          payload: '{"seconds": 30}'
+
+automation:
+  - alias: Warn when the back door is left open
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.back_door
+        to: "on"
+        for: "00:05:00"
+    actions:
+      - action: mqtt.publish
+        data:
+          topic: glowlamp/all/alert
+          payload: '{"seconds": 60}'
+```
+
+To stop one early — the door was closed, the thing was dealt with:
+
+```yaml
+      - action: mqtt.publish
+        data:
+          topic: glowlamp/all/alert
+          payload: "off"
+```
+
+### Testing it
+
+From any machine that can reach the broker:
+
+```sh
+mosquitto_pub -h <broker> -u <user> -P <pass> -t glowlamp/all/alert -m '{"seconds": 15}'
+```
+
+Both lamps should pulse red within a second, at full brightness, whatever they
+were showing and **even if they are switched off**. They return to exactly what
+they were doing when it expires.
+
+If nothing happens, check in this order:
+
+1. `curl http://castor-lamp.local/api/status` — is `mqtt.connected` true? If not,
+   `mqtt.error` says why.
+2. `mosquitto_sub -h <broker> -u <user> -P <pass> -t 'glowlamp/#' -v` in another
+   terminal — does the publish appear at all?
+3. Fire it over REST instead: `curl -X POST 'http://castor-lamp.local/api/alert?seconds=15'`.
+   If that pulses and the MQTT publish does not, the lamp is fine and the broker
+   path is the problem.
+
 ### Reading alert state
 
 `glowlamp/<hostname>/alert/state` carries `on` or `off`, for a binary sensor:

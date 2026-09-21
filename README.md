@@ -82,6 +82,7 @@ UI lives at:
 | `/` | Status, and the controls: on/off, brightness, identify |
 | `/effects` | The everyday page: effect, colors, presets |
 | `/settings` | Firmware check and update, names, MQTT broker, reboot |
+| `/logs` | Diagnostics: why the ring is dark, reset reason, heap, and the device log |
 | `/help` | The REST API, documented by the lamp itself |
 | `/api` | The same reference as JSON |
 | `/wifi` | EasyWiFi's own setup pages |

@@ -53,6 +53,11 @@ int32_t lampAlertRemaining();
 // scaling. Reports the color the cycle is on even while the lamp is off.
 String lampColorHex();
 
+// What the effect is on underneath an overlay, and why the ring is dark if it
+// is. lampDarkReason() returns "" when the ring is lit.
+String lampEffectColorHex();
+const char *lampDarkReason();
+
 // ===== Effects =====
 //
 // An effect set here is deliberately temporary. It expires back to the default

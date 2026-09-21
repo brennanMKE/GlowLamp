@@ -86,6 +86,8 @@ safe to publish and any lamp can be re-provisioned in the field.
 |-
 | <code>/settings</code> || Firmware updates, names, MQTT broker, reboot
 |-
+| <code>/logs</code> || '''Diagnostics''': why the ring is dark, reset reason, heap, device log
+|-
 | <code>/help</code> || The REST API, documented by the lamp itself
 |-
 | <code>/api</code> || The same reference as JSON
@@ -439,6 +441,8 @@ secrets in it.
 |-
 | Lamp reverts after every reconnect || A retained message on the command topic. Clear it with <code>mosquitto_pub -r -n -t glowlamp/<host>/set</code>.
 |-
+| Lamp is plugged in but dark || Open <code>/logs</code>: it names the reason. Most often the lamp is simply switched off &mdash; identify and alerts still work in that state, which makes it look broken rather than off.
+|-
 | Ring looks washed out or white || Colors too far apart on the wheel in ''flicker'', which mixes by design. Use colors that are close together.
 |}
 
@@ -460,4 +464,6 @@ secrets in it.
 | 0.0.6 || <code>/effects</code> page with presets, favicon, steady neon, MQTT failure reporting
 |-
 | 0.0.7 || Alerts over MQTT and REST, including a broadcast topic
+|-
+| 0.0.8 || Diagnostics page, device log over HTTP, honest colour reporting
 |}

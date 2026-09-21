@@ -73,6 +73,8 @@ private:
     void handleSettingsGet();
     void handleSettingsSave();
     void handleHelp();
+    void handleLogPage();
+    void handleApiLog();
     void handleReboot();
 
     // ===== REST API =====

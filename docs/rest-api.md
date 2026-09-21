@@ -55,6 +55,7 @@ one can control it.
 | POST | `/api/ota/check` | — |
 | POST | `/api/ota/install` | — |
 | POST | `/api/ota/update` | — |
+| GET | `/api/log` | — |
 | POST | `/api/reboot` | — |
 
 ### Power
@@ -165,6 +166,18 @@ than the latest release will install the older one.
 A lamp answers the request first, then stops responding for 10–30 s while it
 downloads, then reboots.
 
+### Diagnostics
+
+`GET /api/log` returns the last few KB of the device log as plain text, oldest
+first. `/logs` is the same with a page around it, plus the reset reason, heap,
+and **why the ring is dark** if it is.
+
+`status.diagnostics.dark_because` names that reason in one field — `"the lamp is
+switched off"`, `"brightness is set to 0"` — and is empty when the ring is lit.
+A lamp that is switched off looks exactly like a broken one from across a room,
+and identify and alerts both work in that state, which makes it look broken
+rather than off.
+
 ## Status
 
 ```json
@@ -192,7 +205,9 @@ downloads, then reboots.
 
 | Field | Meaning |
 |---|---|
-| `color` | What the ring is showing right now, before brightness scaling. Reports the color the effect is on even while the lamp is off. |
+| `color` | What the ring is actually lit with, before brightness scaling — black when the lamp is off, red during an alert. |
+| `diagnostics.effect_color` | What the effect is on underneath, which differs whenever an overlay is running or the lamp is off. |
+| `diagnostics.dark_because` | Why the ring is dark, or empty when lit. |
 | `effect.expires_in` | Seconds until it reverts. `-1` when the default is running or the effect lasts until reboot. |
 | `ota.state` | `idle`, `checking`, `installing` or `error`. |
 | `ota.checked` | Seconds since the last completed check, `-1` if none this boot. |

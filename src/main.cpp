@@ -5,6 +5,7 @@
 #include "every_n_millis.h"
 #include "effects.h"
 #include "lamp.h"
+#include "logbuf.h"
 #include "mqtt.h"
 #include "ota.h"
 #include "settings.h"
@@ -94,7 +95,8 @@ CRGB leds[NUM_LEDS];
 // ===== State =====
 static uint8_t brightness = DEFAULT_BRIGHTNESS;
 static bool power = true;
-static CRGB currentColor = CRGB::Black;
+static CRGB currentColor = CRGB::Black;  // what the ring is lit with
+static CRGB effectColor = CRGB::Black;   // what the effect is on, underneath
 
 static bool identifying = false;
 static uint32_t identifyStart = 0;
@@ -181,10 +183,29 @@ int32_t lampAlertRemaining() {
     return (int32_t)((alertEnd - now) / 1000);
 }
 
-String lampColorHex() {
+static String hex(const CRGB &c) {
     char buf[8];
-    snprintf(buf, sizeof(buf), "#%02x%02x%02x", currentColor.r, currentColor.g, currentColor.b);
+    snprintf(buf, sizeof(buf), "#%02x%02x%02x", c.r, c.g, c.b);
     return String(buf);
+}
+
+String lampColorHex() { return hex(currentColor); }
+String lampEffectColorHex() { return hex(effectColor); }
+
+// Why the ring is dark, in the words someone standing in front of it would
+// use. Empty when it is lit.
+//
+// This exists because a lamp that is simply switched off looks identical to a
+// lamp that is broken, and the device knew the answer the whole time without
+// anywhere to say it.
+const char *lampDarkReason() {
+    if (lampAlerting() || lampIdentifying()) return "";
+    if (!power) return "the lamp is switched off";
+    if (brightness == 0) return "brightness is set to 0";
+    if (currentColor.r == 0 && currentColor.g == 0 && currentColor.b == 0) {
+        return "the effect is showing black";
+    }
+    return "";
 }
 
 // Applying a palette resets the per-LED timers with it. Without this, the LEDs
@@ -325,9 +346,6 @@ static void loopLeds() {
             break;
     }
 
-    // What the status page reports. Taken after rendering so it is the color
-    // the ring is actually showing, whichever effect drew it.
-    currentColor = leds[0];
 
     // Expire the overlays. timeReached() rather than a plain compare: an
     // absolute deadline test strands them for 49.7 days if the loop blocks
@@ -351,9 +369,17 @@ static void loopLeds() {
 
     // Identify wins over an alert: someone is standing at the lamp asking which
     // one this is, and they can see the alert on it either way.
+    // effectColor is what the cycle is on; currentColor is what the ring is
+    // actually lit with. They differ whenever an overlay is running or the lamp
+    // is off, and conflating them is how a status page ends up reporting a
+    // colour on a lamp that is dark -- which is exactly the report that made a
+    // switched-off lamp look like a failure.
+    effectColor = leds[0];
+
     if (identifying) {
         bool lit = ((now - identifyStart) / IDENTIFY_BLINK_MS) % 2 == 0;
         fill_solid(leds, NUM_LEDS, lit ? CRGB::White : CRGB::Black);
+        currentColor = leds[0];
         FastLED.show();
         return;
     }
@@ -366,17 +392,22 @@ static void loopLeds() {
         uint8_t wave = triwave8((uint8_t)((into * 255UL) / ALERT_PULSE_MS));
         uint8_t value = ALERT_FLOOR + (uint8_t)(((uint16_t)wave * (255 - ALERT_FLOOR)) / 255);
         fill_solid(leds, NUM_LEDS, CHSV(0, 255, value));
+        currentColor = leds[0];
         FastLED.show();
         return;
     }
 
     if (!power) fill_solid(leds, NUM_LEDS, CRGB::Black);
+    currentColor = leds[0];
     FastLED.show();
 }
 
 void setup() {
     Serial.begin(115200);
     delay(500);  // let USB CDC come up before the first log line
+
+    // Before anything else logs, so a boot is captured from its first line.
+    setupLogBuffer();
 
     FastLED.addLeds<WS2812B, DATA_PIN, GRB>(leds, NUM_LEDS);
     FastLED.setMaxPowerInVoltsAndMilliamps(5, 500);  // volts, mA

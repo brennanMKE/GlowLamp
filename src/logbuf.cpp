@@ -46,6 +46,11 @@ static int logWriter(const char *format, va_list args) {
 
 void setupLogBuffer() {
     previousWriter = esp_log_set_vprintf(&logWriter);
+
+    // The compile-time ceiling is set in platformio.ini; this is the runtime
+    // level, which defaults lower on some builds. Setting it explicitly means
+    // the buffer's contents do not depend on which default happened to apply.
+    esp_log_level_set("*", ESP_LOG_INFO);
 }
 
 String logBufferContents() {

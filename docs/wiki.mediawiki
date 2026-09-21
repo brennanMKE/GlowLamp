@@ -466,4 +466,6 @@ secrets in it.
 | 0.0.7 || Alerts over MQTT and REST, including a broadcast topic
 |-
 | 0.0.8 || Diagnostics page, device log over HTTP, honest colour reporting
+|-
+| 0.0.9 || Route the firmware's own log lines into that buffer
 |}

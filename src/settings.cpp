@@ -137,6 +137,11 @@ void LampSettings::registerRoutes() {
     server.on("/favicon.ico", HTTP_GET, [this]() {
         WebServer &s = configServer.getServer();
         s.sendHeader("Cache-Control", "max-age=86400");
+        s.send_P(200, "image/x-icon", (const char *)FAVICON_ICO, sizeof(FAVICON_ICO));
+    });
+    server.on("/favicon.png", HTTP_GET, [this]() {
+        WebServer &s = configServer.getServer();
+        s.sendHeader("Cache-Control", "max-age=86400");
         s.send_P(200, "image/png", (const char *)FAVICON_32_PNG, sizeof(FAVICON_32_PNG));
     });
     server.on("/icon-180.png", HTTP_GET, [this]() {
@@ -774,9 +779,12 @@ void LampSettings::handleApiReboot() {
 // has nothing for <h2> (its own pages have no subheadings), for tables, or for
 // a range slider. Those get rules here so these pages still look like the WiFi
 // setup screens they sit next to.
+// The .ico comes first and unqualified, which is the form Safari takes; the
+// PNG is offered after it for browsers that would rather have one.
 static const char *HEAD_LINKS =
-    "<link rel='icon' type='image/png' href='/favicon.ico'>"
-    "<link rel='apple-touch-icon' href='/icon-180.png'>"
+    "<link rel='icon' href='/favicon.ico' sizes='any'>"
+    "<link rel='icon' type='image/png' sizes='32x32' href='/favicon.png'>"
+    "<link rel='apple-touch-icon' sizes='180x180' href='/icon-180.png'>"
     "<meta name='theme-color' content='#111111'>";
 
 static const char *EXTRA_CSS =
@@ -821,7 +829,18 @@ String LampSettings::page(const String &title, const String &bodyHtml) {
     // getHTMLHeader() already closes </head> and opens <body>, so the page only
     // supplies the card itself.
     String html = webPages->getHTMLHeader(title);
-    html += HEAD_LINKS;
+
+    // Injected before </head> rather than appended. getHTMLHeader() closes the
+    // head and opens the body, so appending put these link tags in the body --
+    // which Chrome tolerates and Safari ignores outright, so the favicon simply
+    // never appeared there. The stylesheet below is appended because a <style>
+    // in the body does work everywhere; a <link rel=icon> does not.
+    int headEnd = html.indexOf("</head>");
+    if (headEnd >= 0) {
+        html = html.substring(0, headEnd) + HEAD_LINKS + html.substring(headEnd);
+    } else {
+        html += HEAD_LINKS;
+    }
     html += EXTRA_CSS;
     html += "<div class='card'>";
     html += "<h1>" + title + "</h1>";

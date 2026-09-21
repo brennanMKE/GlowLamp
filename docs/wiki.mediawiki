@@ -468,4 +468,6 @@ secrets in it.
 | 0.0.8 || Diagnostics page, device log over HTTP, honest colour reporting
 |-
 | 0.0.9 || Route the firmware's own log lines into that buffer
+|-
+| 0.1.0 || Favicon that Safari accepts: a real .ico, and link tags inside <head>
 |}

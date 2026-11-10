@@ -276,7 +276,7 @@ needs to be added to `configuration.yaml`.
 ```json
 {
   "schema": "json",
-  "name": "Castor",
+  "name": null,
   "unique_id": "glowlamp_44b176051860",
   "state_topic": "glowlamp/castor-lamp/state",
   "command_topic": "glowlamp/castor-lamp/set",
@@ -301,6 +301,11 @@ needs to be added to `configuration.yaml`.
 `unique_id` is the MAC, not the name, so renaming a lamp **updates** the existing
 entity rather than creating a second one. `configuration_url` puts a link to the
 lamp's own settings page in Home Assistant's device panel.
+
+`name` is `null` so Home Assistant names the entity after the device alone
+(`light.castor`). Before 0.1.1 it repeated the device name, which produced
+`light.castor_castor`. An entity created by an older version keeps its existing
+`entity_id`; rename it in Home Assistant if you want the short form.
 
 ### Renaming
 

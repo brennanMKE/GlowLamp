@@ -470,4 +470,6 @@ secrets in it.
 | 0.0.9 || Route the firmware's own log lines into that buffer
 |-
 | 0.1.0 || Favicon that Safari accepts: a real .ico, and link tags inside <head>
+|-
+| 0.1.1 || Home Assistant entity named after the device alone: <code>light.castor</code>, not <code>light.castor_castor</code>
 |}

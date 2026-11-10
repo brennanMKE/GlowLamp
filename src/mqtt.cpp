@@ -175,7 +175,10 @@ static void publishDiscovery() {
 
     JsonDocument doc;
     doc["schema"] = "json";
-    doc["name"] = settings.displayName();
+    // null, not the display name: Home Assistant then names the entity after
+    // the device alone. Repeating the device name here doubled it in every
+    // generated entity_id -- light.castor_castor.
+    doc["name"] = nullptr;
     doc["unique_id"] = id;
     doc["state_topic"] = stateTopic();
     doc["command_topic"] = commandTopic();

@@ -57,7 +57,7 @@ with no separators.
 | `glowlamp/<hostname>/alert/state` | publish | no | `on` / `off` while an alert runs |
 | `glowlamp/<hostname>/sequence` | **subscribe** | **never** | Select a sequence |
 | `glowlamp/all/sequence` | **subscribe** | **never** | The same, to every lamp at once |
-| `glowlamp/<hostname>/pulse` | **subscribe** | **never** | A brief burst of brightness |
+| `glowlamp/<hostname>/pulse` | **subscribe** | **never** | A dip and a white flash |
 | `glowlamp/all/pulse` | **subscribe** | **never** | The same, to every lamp at once |
 | `glowlamp/<hostname>/ota` | **subscribe** | **never** | Firmware update from GitHub |
 | `glowlamp/all/ota` | **subscribe** | **never** | The same, to every lamp at once |
@@ -296,20 +296,31 @@ invisible on a multi-second blend.
 
 ## Subscribe: `glowlamp/<hostname>/pulse` and `glowlamp/all/pulse`
 
-A moment of extra brightness — "something happened" — without the alarm of an
-alert. The lamp jumps to the peak, holds there briefly and eases back down to
-its brightness. Nothing is saved, and the color is untouched.
+A flash — "something happened" — without the alarm of an alert. Nothing is
+saved; the lamp goes straight back to what it was showing.
+
+| Phase | Time (default 750 ms) | What the ring does |
+|---|---|---|
+| Dip | 250 ms | Dims to a fifth of its brightness |
+| Rise | 377 ms | Climbs to the peak, slowly then fast, turning towards white near the top |
+| Peak | 48 ms | Full brightness, **full white** — three frames |
+| Return | 75 ms | Back to its color and brightness |
+
+The dip and the white are what make it visible at any brightness, 255 included.
+A saturated color lights one or two of each LED's channels; white lights all
+three, so the flash outshines anything a sequence can show. `ms` stretches the
+dip and rise; the peak and the return stay fixed.
 
 ```sh
-mosquitto_pub -h broker -t glowlamp/all/pulse -m ''                    # full, 600 ms
+mosquitto_pub -h broker -t glowlamp/all/pulse -m ''                    # 750 ms
 mosquitto_pub -h broker -t glowlamp/all/pulse -m '1000'                # bare number: ms
 mosquitto_pub -h broker -t glowlamp/castor-lamp/pulse -m '{"ms":800,"brightness":200}'
 ```
 
 | Field | Default | Range |
 |---|---|---|
-| `ms` | 600 | 100–5000, clamped |
-| `brightness` | 255 | 1–255. A peak below the lamp's own brightness does nothing. |
+| `ms` | 750 | 300–5000, clamped. The whole pulse. |
+| `brightness` | 255 | 1–255, the peak. Never below the lamp's own brightness. |
 
 **A lamp that is off ignores it.** Unlike an alert, a pulse is for a lamp
 someone is already looking at. An alert or identify running at the same time

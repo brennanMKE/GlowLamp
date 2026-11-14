@@ -49,7 +49,7 @@ one can control it.
 | POST | `/api/alert/clear` | — |
 | GET | `/api/sequences` | — |
 | POST | `/api/sequence` | `{"sequence": "ocean", "fade": 3, "color": "#0080ff"}` |
-| POST | `/api/pulse` | `{"ms": 600, "brightness": 255}` |
+| POST | `/api/pulse` | `{"ms": 750, "brightness": 255}` |
 | GET | `/api/effects` | — |
 | POST | `/api/effect` | `{"effect": "...", "colors": [...], "seconds": 300}` |
 | POST | `/api/effect/reset` | — |
@@ -116,9 +116,10 @@ curl -X POST http://lamp.local/api/pulse
 curl -X POST 'http://lamp.local/api/pulse?ms=1000&brightness=200'
 ```
 
-Jumps to `brightness` (default 255) and eases back over `ms` (default 600,
-100–5000). Nothing is saved. Ignored while the lamp is off. The REST twin of
-the MQTT pulse topics.
+A dip, a rise to `brightness` (default 255) that peaks in a three-frame white
+flash, and a quick return — `ms` in all (default 750, 300–5000). Nothing is
+saved. Ignored while the lamp is off. The REST twin of the MQTT pulse topics;
+the phases are in [mqtt.md](mqtt.md#subscribe-glowlamphostnamepulse-and-glowlampallpulse).
 
 ### Effects
 

@@ -450,8 +450,8 @@ void LampSettings::handleApiIndex() {
     add("GET", "/api/sequences", "", "The named sequences, and which one is selected.");
     add("POST", "/api/sequence", "{\"sequence\": \"ocean\", \"fade\": 3, \"color\": \"#0080ff\"}",
         "Select a sequence and fade to it. Persists. `color` sets breathe's color.");
-    add("POST", "/api/pulse", "{\"ms\": 600, \"brightness\": 255}",
-        "Briefly raise the brightness, then ease back. Ignored while the lamp is off.");
+    add("POST", "/api/pulse", "{\"ms\": 750, \"brightness\": 255}",
+        "Dip, then flash full white and return. Ignored while the lamp is off.");
     add("GET", "/api/effects", "", "The custom effects this firmware can render, and the limits.");
     add("POST", "/api/effect",
         "{\"effect\": \"blend\", \"colors\": [\"#ff0000\"], \"seconds\": 300}",

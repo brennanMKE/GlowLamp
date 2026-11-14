@@ -4,7 +4,7 @@
     python3 -I scripts/ha_lamp_schedule.py --apply    # make the changes
 
 Normally run through scripts/ha_lamp_schedule.sh, which loads HA_URL and
-HA_TOKEN from ~/Developer/RaspberryPi/.env and passes the automations file.
+HA_TOKEN from ~/Developer/Workshop/.env and passes the automations file.
 
 Three changes, each skipped when it is already done, so running it twice is safe:
   1. Rename light.castor_castor -> light.castor and light.pollux_pollux ->

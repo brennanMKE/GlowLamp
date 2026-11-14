@@ -51,10 +51,11 @@ int32_t lampAlertRemaining();
 
 // ===== Pulse =====
 //
-// A moment of extra brightness for Home Assistant to fire on an event: straight
-// up to `level` (0 means full) and eased back down to the configured
-// brightness over `ms` (0 means the default, 600 ms; clamped to 100-5000).
-// Nothing is saved.
+// A flash for Home Assistant to fire on an event: a dip, a rise to `level` (0
+// means full) climaxing in a moment of full white, and a quick return to the
+// color and brightness the lamp had. `ms` is the whole thing (0 means the
+// default, 750 ms; clamped to 300-5000). Nothing is saved. Visible at any
+// brightness, including 255 -- the dip and the white do that.
 //
 // Ignored while the lamp is off -- unlike an alert, a pulse is not meant to
 // reach someone who switched the lamp off. Returns false when it was ignored.

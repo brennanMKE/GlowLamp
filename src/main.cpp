@@ -36,11 +36,30 @@ static const uint32_t CUSTOM_FADE_MS = 1500;
 static const uint32_t DEFAULT_BREATHE_RGB = 0x0080ff;
 
 // ===== Pulse =====
-// A moment of extra brightness that Home Assistant fires on an event. Jumps to
-// the peak and eases back to the configured brightness; nothing is saved.
-static const uint32_t PULSE_DEFAULT_MS = 600;
-static const uint32_t PULSE_MIN_MS = 100;
+// A flash Home Assistant fires on an event. Four phases:
+//
+//   dip      down to a fifth of the current brightness   40% of the lead-in
+//   rise     back up past it to the peak, accelerating   60% of the lead-in
+//   peak     full brightness AND full white               PULSE_PEAK_FRAMES
+//   return   back to the color and brightness it had      PULSE_RETURN_MS
+//
+// The lead-in is whatever the total leaves after peak and return. The dip is
+// what makes it visible on a lamp that is already bright -- the old pulse only
+// went up, and did nothing at all at 255 -- and white is the only way past
+// 255: a saturated color lights one or two of each LED's channels, white
+// lights all three. Nothing is saved.
+//
+// The peak is counted in frames, not ms, because a frame is the unit the eye
+// actually gets: three of them (48 ms) is long enough to register as a flash
+// without settling into a glow.
+static const uint32_t PULSE_DEFAULT_MS = 750;
+static const uint32_t PULSE_MIN_MS = 300;
 static const uint32_t PULSE_MAX_MS = 5000;
+static const uint32_t PULSE_PEAK_FRAMES = 3;
+static const uint32_t PULSE_RETURN_MS = 75;
+static const uint8_t PULSE_DIP_PERCENT = 40;  // of the lead-in; the rise gets the rest
+static const uint8_t PULSE_DIP_FLOOR = 51;    // fraction of brightness at the bottom, /255
+static const uint8_t PULSE_WHITEN_FROM = 192; // how far into the rise white starts, /255
 
 // ===== Timing =====
 // The custom effects (REST and the effects page). Milliseconds to cross from
@@ -254,7 +273,7 @@ bool pulseLamp(uint32_t ms, uint8_t level) {
     pulseMs = ms;
     pulseLevel = level;
     pulsing = true;
-    ESP_LOGI(TAG, "pulse to %u over %lums", level, (unsigned long)ms);
+    ESP_LOGI(TAG, "pulse: dip, then flash to %u and white, %lums", level, (unsigned long)ms);
     return true;
 }
 
@@ -508,6 +527,45 @@ static void advanceClock(uint32_t delta) {
     clockErrorMs = (int32_t)err;
 }
 
+// One frame of the pulse, `into` ms after it started, on a lamp at `base`:
+// what brightness to show and how far towards white (0 none, 255 full).
+static void pulseFrame(uint32_t into, uint8_t base, uint8_t &bright, uint8_t &white) {
+    uint8_t peak = pulseLevel > base ? pulseLevel : base;
+    uint8_t bottom = scale8(base, PULSE_DIP_FLOOR);
+    const uint32_t peakMs = PULSE_PEAK_FRAMES * FRAME_MS;
+    uint32_t lead = pulseMs - peakMs - PULSE_RETURN_MS;
+    uint32_t dipMs = lead * PULSE_DIP_PERCENT / 100;
+    uint32_t riseMs = lead - dipMs;
+
+    if (into < dipMs) {
+        uint8_t f = (uint8_t)((into * 255U) / dipMs);
+        bright = lerp8by8(base, bottom, ease8InOutQuad(f));
+        white = 0;
+        return;
+    }
+    into -= dipMs;
+    if (into < riseMs) {
+        uint8_t f = (uint8_t)((into * 255U) / riseMs);
+        // Squared: slow off the bottom, fastest into the peak, so the flash
+        // arrives as a climax rather than a ramp.
+        bright = lerp8by8(bottom, peak, scale8(f, f));
+        white = f > PULSE_WHITEN_FROM
+                    ? (uint8_t)(((uint16_t)(f - PULSE_WHITEN_FROM) * 255U) / (255 - PULSE_WHITEN_FROM))
+                    : 0;
+        return;
+    }
+    into -= riseMs;
+    if (into < peakMs) {
+        bright = peak;
+        white = 255;
+        return;
+    }
+    into -= peakMs;
+    uint8_t f = into >= PULSE_RETURN_MS ? 255 : (uint8_t)((into * 255U) / PULSE_RETURN_MS);
+    bright = lerp8by8(peak, base, f);
+    white = (uint8_t)(255 - f);
+}
+
 static void loopLeds() {
     static uint32_t lastFrame = 0;
 
@@ -548,6 +606,23 @@ static void loopLeds() {
             for (uint8_t i = 0; i < NUM_LEDS; i++) px[i] = blendHsv(px[i], in[i], frac);
         }
     }
+    // The pulse decides brightness and how far towards white the ring is
+    // pushed. It only touches lamps that are on: see pulseLamp().
+    if (pulsing && now - pulseStart >= pulseMs) pulsing = false;
+    uint8_t pulseBright = 0, pulseWhite = 0;
+    bool pulseShowing = pulsing && power;
+    if (pulseShowing) {
+        pulseFrame(now - pulseStart, brightness, pulseBright, pulseWhite);
+        if (pulseWhite) {
+            // Desaturating keeps value: s=0, v=255 is full white.
+            uint8_t keep = (uint8_t)(255 - pulseWhite);
+            for (uint8_t i = 0; i < NUM_LEDS; i++) {
+                px[i].s = scale8(px[i].s, keep);
+                px[i].v = qadd8(px[i].v, scale8((uint8_t)(255 - px[i].v), pulseWhite));
+            }
+        }
+    }
+
     for (uint8_t i = 0; i < NUM_LEDS; i++) leds[i] = px[i];
 
     // Expire the overlays. timeReached() rather than a plain compare: an
@@ -558,20 +633,11 @@ static void loopLeds() {
         alerting = false;
         ESP_LOGI(TAG, "alert over");
     }
-    if (pulsing && now - pulseStart >= pulseMs) pulsing = false;
 
     // One decision about brightness per frame, made here rather than by
     // whichever overlay started last. They all override what someone chose,
     // and they can overlap.
-    uint8_t want = brightness;
-    if (pulsing && power && pulseLevel > want) {
-        // Straight to the peak, then eased back down: the cubic holds near
-        // the top for a moment before falling, which is what makes it read as
-        // a pulse rather than a flicker.
-        uint8_t frac = (uint8_t)(((uint64_t)(now - pulseStart) * 255U) / pulseMs);
-        uint8_t left = (uint8_t)(255 - ease8InOutCubic(frac));
-        want = (uint8_t)(want + scale8((uint8_t)(pulseLevel - want), left));
-    }
+    uint8_t want = pulseShowing ? pulseBright : brightness;
     if (identifying && want < IDENTIFY_MIN_BRIGHTNESS) want = IDENTIFY_MIN_BRIGHTNESS;
     if (alerting) want = ALERT_BRIGHTNESS;
     if (want != appliedBrightness) {

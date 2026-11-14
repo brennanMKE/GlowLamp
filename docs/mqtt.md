@@ -55,6 +55,16 @@ with no separators.
 | `glowlamp/<hostname>/alert` | **subscribe** | **never** | Fire or clear an alert |
 | `glowlamp/all/alert` | **subscribe** | **never** | The same, to every lamp at once |
 | `glowlamp/<hostname>/alert/state` | publish | no | `on` / `off` while an alert runs |
+| `glowlamp/<hostname>/sequence` | **subscribe** | **never** | Select a sequence |
+| `glowlamp/all/sequence` | **subscribe** | **never** | The same, to every lamp at once |
+| `glowlamp/<hostname>/pulse` | **subscribe** | **never** | A brief burst of brightness |
+| `glowlamp/all/pulse` | **subscribe** | **never** | The same, to every lamp at once |
+| `glowlamp/<hostname>/ota` | **subscribe** | **never** | Firmware update from GitHub |
+| `glowlamp/all/ota` | **subscribe** | **never** | The same, to every lamp at once |
+
+`all` means every lamp on **this broker**. Lamps in another building on another
+broker are a separate `all` — but they still show the same colors, because sync
+comes from the clock, not from the broker. See [Sequences](#sequences).
 
 **Never retain a command.** A retained command replays on every reconnect, which
 pins the lamp to whatever was last sent and makes it impossible to control from
@@ -68,20 +78,20 @@ Assistant knows the lamp the moment it restarts.
 Home Assistant's JSON light schema. Any subset of the fields, in one message.
 
 ```json
-{"state": "ON", "brightness": 200, "color": {"r": 255, "g": 0, "b": 0}, "effect": "neon"}
+{"state": "ON", "brightness": 200, "effect": "ocean"}
 ```
 
 | Field | Type | Meaning |
 |---|---|---|
 | `state` | `"ON"` / `"OFF"` | Power. Persisted, so it survives a power cut. |
 | `brightness` | 0–255 | Persisted. Independent of power. |
-| `effect` | `blend`, `loop`, `flicker`, `neon` | Keeps the current palette. |
-| `color` | `{"r":,"g":,"b":}` | **Replaces** the palette with this one color. |
+| `effect` | A [sequence](#sequences) name | Fades to that sequence over 3 s. Persisted. |
+| `color` | `{"r":,"g":,"b":}` | Sets **breathe**'s color, persisted. Sent without `effect`, it also selects breathe. |
 
 ```sh
 mosquitto_pub -h broker -t glowlamp/castor-lamp/set -m '{"state":"OFF"}'
 mosquitto_pub -h broker -t glowlamp/castor-lamp/set -m '{"state":"ON","brightness":200}'
-mosquitto_pub -h broker -t glowlamp/castor-lamp/set -m '{"effect":"flicker"}'
+mosquitto_pub -h broker -t glowlamp/castor-lamp/set -m '{"effect":"sunset"}'
 mosquitto_pub -h broker -t glowlamp/castor-lamp/set -m '{"color":{"r":0,"g":0,"b":255}}'
 ```
 
@@ -103,7 +113,7 @@ message from landing.
 | Malformed JSON | Whole message ignored, logged |
 | `{}` | Nothing changes |
 | `{"state": true}` | **Ignored** — see below |
-| `{"effect": "chase"}` | Effect unchanged; other fields still apply |
+| `{"effect": "chase"}` | Sequence unchanged; other fields still apply |
 | `{"brightness": 999}` | Brightness unchanged; other fields still apply |
 
 `state` must be the **word** `"ON"` or `"OFF"`, not a boolean. `{"state": true}`
@@ -112,10 +122,10 @@ debug — it is the single most common mistake with the JSON light schema.
 
 ### Not supported
 
-`transition`, `flash`, `color_temp`, `white`, `hs`/`xy` color, and effect
-parameters (speed, intensity, multi-color palettes). A palette of up to five
-colors is a REST-only feature; Home Assistant's light entity has one color
-picker, so MQTT sets one color. See [rest-api.md](rest-api.md#effects).
+`transition`, `flash`, `color_temp`, `white`, `hs`/`xy` color, and the custom
+effects (`blend`, `loop`, `flicker`, `neon` with your own palette of up to five
+colors). Those are REST and effects-page only, because Home Assistant's light
+entity has one color picker. See [rest-api.md](rest-api.md#effects).
 
 ## Subscribe: `glowlamp/<hostname>/alert` and `glowlamp/all/alert`
 
@@ -234,10 +244,121 @@ mqtt:
 It is **not retained**: a retained `on` would come back after a broker restart
 and describe an alert that finished hours ago.
 
+## Sequences
+
+A sequence is a named look: its colors, how it moves between them, and how fast.
+One is always selected. It is what Home Assistant lists as the light's effects,
+and it survives a power cut.
+
+| Sequence | Colors | Behavior | In step across lamps |
+|---|---|---|---|
+| `vibrant` | red, gold, green, azure, magenta | Eases from one to the next, 6 s each. The default. | yes |
+| `ocean` | teal, azure, blue, indigo | Slow blend, 10 s each, with a shallow 8 s swell | yes |
+| `sunset` | magenta, red, orange, gold | Out to gold and back again, 12 s per step | yes |
+| `aurora` | green, teal, violet | Uneven legs, 6–14 s, so it wanders | yes |
+| `spectrum` | the whole wheel | One turn a minute | yes |
+| `party` | the vibrant five | Holds, then snaps to the next, every 1.5 s | yes |
+| `breathe` | one color you pick | Rises and falls over 5 s | yes |
+| `ember` | red and amber | Flicker, like a fire | **no**, on purpose |
+
+### Selecting one
+
+```sh
+mosquitto_pub -h broker -t glowlamp/all/sequence -m 'ocean'
+mosquitto_pub -h broker -t glowlamp/castor-lamp/sequence -m '{"sequence":"party","fade":1}'
+mosquitto_pub -h broker -t glowlamp/castor-lamp/set -m '{"effect":"aurora"}'   # same thing
+```
+
+`fade` is seconds, 0–30, default 3. Names are case-insensitive; an unknown name
+is logged and ignored.
+
+### How lamps stay in step
+
+Nothing passes between the lamps. Each one draws its sequence from the wall
+clock — NTP time, re-synced every 15 minutes — so two lamps on the same
+sequence are showing the same moment of it, whether they share a broker, a
+network, or neither. Typical agreement is within a few tens of milliseconds,
+invisible on a multi-second blend.
+
+* **Before NTP answers** a lamp runs on its own uptime. When the time arrives it
+  steers into step without a visible jump: first by whole cycles, which look
+  like nothing, then by running up to half again as fast, or half as fast, until
+  it has caught up. `clock.synced` and `clock.error_ms` in `/api/status` show
+  where it is.
+* **Switching sequence** cross-fades over `fade` seconds, starting on the next
+  whole second at least half a second out. A broadcast reaches lamps tens of
+  milliseconds apart; starting on the same second makes them fade together.
+* **`ember` is not synced.** Two fires flickering in lockstep look like one lamp
+  being dimmed. Its colors and pace still match.
+* A **custom effect** from the effects page or REST shows over the sequence
+  until it expires. It runs on the same clock, so two lamps given the same one
+  also match. Home Assistant keeps showing the sequence as the effect meanwhile.
+
+## Subscribe: `glowlamp/<hostname>/pulse` and `glowlamp/all/pulse`
+
+A moment of extra brightness — "something happened" — without the alarm of an
+alert. The lamp jumps to the peak, holds there briefly and eases back down to
+its brightness. Nothing is saved, and the color is untouched.
+
+```sh
+mosquitto_pub -h broker -t glowlamp/all/pulse -m ''                    # full, 600 ms
+mosquitto_pub -h broker -t glowlamp/all/pulse -m '1000'                # bare number: ms
+mosquitto_pub -h broker -t glowlamp/castor-lamp/pulse -m '{"ms":800,"brightness":200}'
+```
+
+| Field | Default | Range |
+|---|---|---|
+| `ms` | 600 | 100–5000, clamped |
+| `brightness` | 255 | 1–255. A peak below the lamp's own brightness does nothing. |
+
+**A lamp that is off ignores it.** Unlike an alert, a pulse is for a lamp
+someone is already looking at. An alert or identify running at the same time
+wins.
+
+From Home Assistant:
+
+```yaml
+action: mqtt.publish
+data:
+  topic: glowlamp/all/pulse
+  payload: ""
+```
+
+## Subscribe: `glowlamp/<hostname>/ota` and `glowlamp/all/ota`
+
+The MQTT twin of `/api/ota/*`: the lamp asks GitHub for the latest release, and
+installs it if told to.
+
+```sh
+mosquitto_pub -h broker -t glowlamp/all/ota -m ''                 # update every lamp
+mosquitto_pub -h broker -t glowlamp/castor-lamp/ota -m 'check'    # ask, install nothing
+mosquitto_pub -h broker -t glowlamp/castor-lamp/ota -m 'install'  # take it regardless
+```
+
+| Payload | What it does |
+|---|---|
+| empty or `update` | Check, and install only if the latest release differs from what is running. A no-op on a lamp that is current, so it is safe to fire at every lamp on a schedule. |
+| `check` | Ask GitHub and report in `/api/status`; installs nothing |
+| `install` | Take the latest release unconditionally. **Per-lamp topic only** — on `all` it is treated as `update`, because reinstalling every lamp at once is never what an automation means. |
+
+An installing lamp drops off for 10–30 s, reboots on the new version, and comes
+back with its sequence, brightness and power as they were. Home Assistant shows
+it unavailable in between, from the last will.
+
+Comparison is by tag equality, not ordering, so a lamp flashed by hand with a
+version newer than the latest release will install the release — see the README.
+
+```yaml
+action: mqtt.publish
+data:
+  topic: glowlamp/all/ota
+  payload: ""
+```
+
 ## Publish: `glowlamp/<hostname>/state`
 
 ```json
-{"state":"ON","brightness":90,"color_mode":"rgb","color":{"r":255,"g":32,"b":0},"effect":"flicker"}
+{"state":"ON","brightness":90,"color_mode":"rgb","color":{"r":255,"g":0,"b":0},"effect":"vibrant"}
 ```
 
 | Field | Meaning |
@@ -245,14 +366,13 @@ and describe an alert that finished hours ago.
 | `state` | `"ON"` or `"OFF"` |
 | `brightness` | 0–255 |
 | `color_mode` | Always `"rgb"` |
-| `color` | The palette's **first** color, not the live one |
-| `effect` | The running effect |
+| `color` | The sequence's color — breathe's color, or the first step of any other — not the live one |
+| `effect` | The selected sequence |
 
 Published on connect, after every accepted command, and whenever power,
-brightness, effect or the palette's first color changes — **not per frame**. The
-live color moves continuously under `blend`, so publishing it would be a message
-every 16 ms for a value nothing can act on. The first palette entry is stable,
-and is the color someone actually picked.
+brightness, the sequence or its color changes — **not per frame**. The live
+color moves continuously, so publishing it would be a message every 16 ms for a
+value nothing can act on.
 
 Changes made from the web UI or the REST API publish too, so Home Assistant
 follows along when a lamp is changed at the lamp.
@@ -286,7 +406,7 @@ needs to be added to `configuration.yaml`.
   "brightness": true,
   "supported_color_modes": ["rgb"],
   "effect": true,
-  "effect_list": ["blend", "loop", "flicker", "neon"],
+  "effect_list": ["vibrant", "ocean", "sunset", "aurora", "spectrum", "party", "breathe", "ember"],
   "device": {
     "identifiers": ["glowlamp_44b176051860"],
     "name": "Castor",

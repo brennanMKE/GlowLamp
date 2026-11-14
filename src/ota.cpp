@@ -7,6 +7,7 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <esp_log.h>
+#include <esp_sntp.h>
 #include <time.h>
 
 #include "version.h"
@@ -226,11 +227,15 @@ static void checkAndInstall() {
 void loopOta() {
     if (WiFi.status() != WL_CONNECTED) return;
 
-    // NTP once per boot, after WiFi is up. Only the daily scheduler needs it --
-    // the checks themselves query GitHub directly and do not care about the clock.
+    // NTP once per boot, after WiFi is up. The daily scheduler needs it, and so
+    // does every lamp's color: sequences are drawn from the wall clock so lamps
+    // stay in step without talking to each other (see main.cpp). SNTP then
+    // re-syncs on its own every 15 minutes rather than the default hour, which
+    // keeps two lamps' crystals from drifting apart by more than a few ms.
     static bool timeConfigured = false;
     static uint32_t wifiUpAt = 0;
     if (!timeConfigured) {
+        sntp_set_sync_interval(15UL * 60 * 1000);
         configTzTime("PST8PDT,M3.2.0,M11.1.0/2", "pool.ntp.org", "time.nist.gov");
         timeConfigured = true;
         wifiUpAt = millis();

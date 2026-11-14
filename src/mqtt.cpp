@@ -8,6 +8,8 @@
 #include "effects.h"
 #include "every_n_millis.h"
 #include "lamp.h"
+#include "ota.h"
+#include "sequences.h"
 #include "settings.h"
 #include "version.h"
 
@@ -21,7 +23,7 @@ static uint32_t retryAt = 0;
 
 // What was last published, so state goes out when something changes rather than
 // 60 times a second. The lamp's live color moves constantly under blend; the
-// color reported to Home Assistant is the palette's first entry instead, which
+// color reported to Home Assistant is the sequence's own color instead, which
 // is stable and is what someone picked.
 // Why the last connect attempt failed. Kept because the alternative is a serial
 // cable: a broker that refuses a lamp does so silently from the network's point
@@ -56,12 +58,21 @@ static String commandTopic() { return baseTopic() + "/set"; }
 static String availabilityTopic() { return baseTopic() + "/availability"; }
 static String alertTopic() { return baseTopic() + "/alert"; }
 static String alertStateTopic() { return baseTopic() + "/alert/state"; }
+static String sequenceTopic() { return baseTopic() + "/sequence"; }
+static String pulseTopic() { return baseTopic() + "/pulse"; }
+static String otaTopic() { return baseTopic() + "/ota"; }
 
 // One publish that reaches every lamp. Home Assistant firing an alert almost
 // never means "that lamp" -- it means "whoever is in the building" -- and a
 // broadcast keeps an automation from having to name each lamp and be edited
 // when a third one arrives.
 static const char *ALERT_ALL_TOPIC = "glowlamp/all/alert";
+
+// The same for sequences and pulses. A lamp only hears "all" from its own
+// broker, so lamps in another building are a separate "all".
+static const char *SEQUENCE_ALL_TOPIC = "glowlamp/all/sequence";
+static const char *PULSE_ALL_TOPIC = "glowlamp/all/pulse";
+static const char *OTA_ALL_TOPIC = "glowlamp/all/ota";
 
 bool mqttEnabled() { return settings.mqttHost().length() > 0; }
 bool mqttConnected() { return mqtt.connected(); }
@@ -102,20 +113,16 @@ void mqttSettingsChanged() {
 
 // The color to report: the first palette entry of whatever is running. Not the
 // live blended color -- that changes every frame, and publishing it would be a
-// state message per frame for a value nobody can act on.
-static uint32_t reportedColor() {
-    uint32_t colors[MAX_COLORS];
-    uint8_t count = lampEffectColors(colors);
-    return count ? colors[0] : 0;
-}
-
 static void publishState(bool force = false) {
     if (!mqtt.connected()) return;
 
     bool power = lampPower();
     uint8_t brightness = lampBrightness();
-    String effect = lampEffectName();
-    uint32_t color = reportedColor();
+    // The sequence, which is what Home Assistant knows as the effect -- even
+    // while a custom effect from the effects page is showing over it -- and
+    // the one color that stands for it.
+    String effect = lampSequenceName();
+    uint32_t color = lampSequenceColor();
 
     if (!force && everPublished && power == lastPower && brightness == lastBrightness &&
         effect == lastEffect && color == lastColor) {
@@ -188,7 +195,9 @@ static void publishDiscovery() {
     doc["brightness"] = true;
     doc["supported_color_modes"][0] = "rgb";
     doc["effect"] = true;
-    for (uint8_t i = 0; i < EFFECT_COUNT; i++) doc["effect_list"][i] = EFFECT_NAMES[i];
+    // The sequences, not the custom effects: those need a palette, which a
+    // light entity's one color picker cannot give them.
+    for (uint8_t i = 0; i < SEQUENCE_COUNT; i++) doc["effect_list"][i] = SEQUENCES[i].name;
 
     JsonObject device = doc["device"].to<JsonObject>();
     device["identifiers"][0] = id;
@@ -211,6 +220,88 @@ static void publishDiscovery() {
              (unsigned)payload.length());
 }
 
+// Select a sequence, saving it. Used by the effect field and the sequence topics.
+static void selectSequence(uint8_t index, uint32_t fadeMs) {
+    setLampSequence(index, fadeMs);
+    settings.saveSequence(SEQUENCES[index].name);
+}
+
+// glowlamp/<host>/sequence and glowlamp/all/sequence: a bare name, or
+// {"sequence":"ocean","fade":3}. Fade is in seconds, 0-30.
+static void onSequence(const String &msg) {
+    String name = msg;
+    name.trim();
+    long fade = 3;
+
+    JsonDocument doc;
+    if (name.startsWith("{")) {
+        if (deserializeJson(doc, name)) {
+            ESP_LOGW(TAG, "could not parse sequence command as JSON");
+            return;
+        }
+        name = doc["sequence"].is<const char *>() ? doc["sequence"].as<const char *>()
+                                                    : (doc["name"] | "");
+        if (doc["fade"].is<long>()) fade = doc["fade"].as<long>();
+    }
+    if (fade < 0) fade = 0;
+    if (fade > 30) fade = 30;
+
+    uint8_t index = findSequence(name.c_str());
+    if (index == SEQUENCE_COUNT) {
+        ESP_LOGW(TAG, "no sequence called \"%s\"", name.c_str());
+        return;
+    }
+    selectSequence(index, (uint32_t)fade * 1000UL);
+}
+
+// glowlamp/<host>/pulse and glowlamp/all/pulse. Forgiving like the alert:
+// empty for the defaults, a bare number for milliseconds, or
+// {"ms":800,"brightness":255}.
+static void onPulse(const String &msg) {
+    String body = msg;
+    body.trim();
+    uint32_t ms = 0;     // 0 means the default, decided in main.cpp
+    uint8_t level = 0;   // 0 means full
+
+    JsonDocument doc;
+    if (body.startsWith("{") && !deserializeJson(doc, body)) {
+        if (doc["ms"].is<long>() && doc["ms"].as<long>() > 0) ms = doc["ms"].as<long>();
+        if (doc["brightness"].is<long>()) {
+            long v = doc["brightness"].as<long>();
+            if (v >= 1 && v <= 255) level = (uint8_t)v;
+        }
+    } else if (body.toInt() > 0) {
+        ms = (uint32_t)body.toInt();
+    }
+    pulseLamp(ms, level);
+}
+
+// glowlamp/<host>/ota and glowlamp/all/ota. Queued, like the REST calls: the
+// work happens in loopOta(), not inside the MQTT callback.
+//
+//   "" or "update"  check, and install only if the release differs
+//   "check"         ask GitHub and report; installs nothing
+//   "install"       take the latest release regardless -- ONE lamp only
+//
+// "install" on the all topic is treated as "update". Reinstalling every lamp at
+// once is never what an automation means, and "update" already installs
+// wherever there is something new.
+static void onOta(const String &msg, bool all) {
+    String body = msg;
+    body.trim();
+    body.toLowerCase();
+    if (body == "check") {
+        ESP_LOGI(TAG, "OTA check requested");
+        requestOtaCheck();
+    } else if (body == "install" && !all) {
+        ESP_LOGI(TAG, "OTA install requested");
+        requestOtaInstall();
+    } else {
+        ESP_LOGI(TAG, "OTA update requested");
+        requestOtaUpdate();
+    }
+}
+
 // Home Assistant sends the JSON light schema: any of state, brightness, color
 // and effect, in one message.
 //
@@ -224,6 +315,19 @@ static void onMessage(char *topic, byte *payload, unsigned int length) {
     ESP_LOGI(TAG, "%s: %s", topic, msg.c_str());
 
     String t(topic);
+    if (t.endsWith("/ota")) {
+        onOta(msg, t == OTA_ALL_TOPIC);
+        return;
+    }
+    if (t.endsWith("/pulse")) {
+        onPulse(msg);
+        return;
+    }
+    if (t.endsWith("/sequence")) {
+        onSequence(msg);
+        publishState(true);
+        return;
+    }
     if (t.endsWith("/alert")) {
         // Deliberately forgiving about the payload. An alert is fired from an
         // automation in a hurry, and the difference between {"seconds":30} and
@@ -270,33 +374,24 @@ static void onMessage(char *topic, byte *payload, unsigned int length) {
         }
     }
 
-    // Color and effect both land as "the current effect, with this palette", so
-    // they are resolved together before either is applied.
+    // The effect is a sequence. A color is breathe's color, and on its own --
+    // Home Assistant's color picker -- it also selects breathe, because that is
+    // the sequence built around one color someone picked.
     bool haveColor = doc["color"]["r"].is<int>();
-    bool haveEffect = doc["effect"].is<const char *>();
-    if (haveColor || haveEffect) {
-        uint8_t mode = lampEffectMode();
-        if (haveEffect) {
-            String wanted = doc["effect"].as<String>();
-            for (uint8_t i = 0; i < EFFECT_COUNT; i++) {
-                if (wanted == EFFECT_NAMES[i]) mode = i;
-            }
-        }
-
-        uint32_t colors[MAX_COLORS];
-        uint8_t count;
-        if (haveColor) {
-            // Home Assistant's color picker is one color, so it replaces the
-            // palette rather than joining it.
-            colors[0] = ((uint32_t)(doc["color"]["r"].as<uint8_t>()) << 16) |
-                        ((uint32_t)(doc["color"]["g"].as<uint8_t>()) << 8) |
-                        doc["color"]["b"].as<uint8_t>();
-            count = 1;
-        } else {
-            count = lampEffectColors(colors);
-        }
-        setLampEffect(mode, colors, count, 0);
+    uint8_t index = SEQUENCE_COUNT;
+    if (doc["effect"].is<const char *>()) {
+        index = findSequence(doc["effect"].as<const char *>());
+        if (index == SEQUENCE_COUNT) ESP_LOGW(TAG, "unknown effect ignored");
     }
+    if (haveColor) {
+        uint32_t rgb = ((uint32_t)(doc["color"]["r"].as<uint8_t>()) << 16) |
+                       ((uint32_t)(doc["color"]["g"].as<uint8_t>()) << 8) |
+                       doc["color"]["b"].as<uint8_t>();
+        setLampBreatheColor(rgb);
+        settings.saveBreatheColor(rgb);
+        if (index == SEQUENCE_COUNT && !doc["effect"].is<const char *>()) index = SEQ_BREATHE;
+    }
+    if (index < SEQUENCE_COUNT) selectSequence(index, 3000);
 
     // State last: turning on and setting a color in one message should end up
     // on, whatever order the fields arrived in.
@@ -373,8 +468,16 @@ void loopMqtt() {
     mqtt.subscribe(commandTopic().c_str());
     mqtt.subscribe(alertTopic().c_str());
     mqtt.subscribe(ALERT_ALL_TOPIC);
-    ESP_LOGI(TAG, "subscribed to %s, %s and %s", commandTopic().c_str(), alertTopic().c_str(),
-             ALERT_ALL_TOPIC);
+    mqtt.subscribe(sequenceTopic().c_str());
+    mqtt.subscribe(SEQUENCE_ALL_TOPIC);
+    mqtt.subscribe(pulseTopic().c_str());
+    mqtt.subscribe(PULSE_ALL_TOPIC);
+    mqtt.subscribe(otaTopic().c_str());
+    mqtt.subscribe(OTA_ALL_TOPIC);
+    ESP_LOGI(TAG,
+             "subscribed to %s/{set,alert,sequence,pulse,ota} and "
+             "glowlamp/all/{alert,sequence,pulse,ota}",
+             baseTopic().c_str());
 
     publishDiscovery();
     publishState(true);

@@ -79,8 +79,8 @@ UI lives at:
 
 | Path | What |
 |---|---|
-| `/` | Status, and the controls: on/off, brightness, identify |
-| `/effects` | The everyday page: effect, colors, presets |
+| `/` | Status, and the controls: on/off, brightness, identify, pulse |
+| `/effects` | The everyday page: sequence, breathe color, custom effect, presets |
 | `/settings` | Firmware check and update, names, MQTT broker, reboot |
 | `/logs` | Diagnostics: why the ring is dark, reset reason, heap, and the device log |
 | `/help` | The REST API, documented by the lamp itself |
@@ -140,7 +140,35 @@ A red pulse to get attention, for Home Assistant to fire at something that needs
 a person. It overrides the effect, the brightness and the power state, then puts
 all three back, and always expires. See [docs/mqtt.md](docs/mqtt.md#subscribe-glowlamphostnamealert-and-glowlampallalert).
 
-### Effects
+### Sequences
+
+A lamp always runs one named sequence — `vibrant` (the default), `ocean`,
+`sunset`, `aurora`, `spectrum`, `party`, `breathe` or `ember` — and keeps it
+across power cuts. Every lamp draws its sequence from NTP time, so lamps on the
+same one show the same color at the same moment with no coordination between
+them, even on different networks. Switching cross-fades over 3 s.
+
+```sh
+mosquitto_pub -h broker -t glowlamp/all/sequence -m 'ocean'
+curl -X POST 'http://castor-lamp.local/api/sequence?sequence=sunset'
+```
+
+These are the light's effect list in Home Assistant. See
+[docs/mqtt.md](docs/mqtt.md#sequences).
+
+### Pulse
+
+A brief burst of brightness that eases back after 600 ms, for Home Assistant to
+fire on an event. Ignored by a lamp that is off.
+
+```sh
+mosquitto_pub -h broker -t glowlamp/all/pulse -m ''
+curl -X POST http://castor-lamp.local/api/pulse
+```
+
+### Custom effects
+
+Your own palette, shown over the sequence for a while.
 
 ```sh
 curl -X POST 'http://glow-lamp-051860.local/api/effect?effect=neon&colors=ff0000,00ff00,0000ff'
@@ -149,12 +177,12 @@ curl -X POST http://glow-lamp-051860.local/api/effect/reset
 
 | Effect | What it does |
 |---|---|
-| `blend` | The whole ring holds one color and eases to the next. The default. |
+| `blend` | The whole ring holds one color and eases to the next. |
 | `loop` | Walks the palette steadily, never resting on a color. |
 | `flicker` | Similar colors mixing and guttering, like a flame. The one effect that lights the ring several colors at once. |
 | `neon` | One color at full brightness, held steady, switching cleanly to the next. |
 
-Up to 5 colors. An effect reverts to the default after 5 minutes unless you say
+Up to 5 colors. An effect reverts to the sequence after 5 minutes unless you say
 otherwise, is capped at 8 hours, and does not survive a reboot — see
 [docs/rest-api.md](docs/rest-api.md#effects) for why that is the default.
 
@@ -236,7 +264,7 @@ A lamp can find out about a new release three ways:
 |---|---|
 | 15 s after joining WiFi | Checks, and installs if the tag differs |
 | Daily at 15:00 local | Same |
-| `POST /api/ota/update` | Same, on someone else's schedule |
+| `POST /api/ota/update`, or MQTT `glowlamp/all/ota` | Same, on someone else's schedule |
 | The settings page, or `POST /api/ota/check` | Checks only, and reports |
 
 The first two are unattended, so they install on their own — nobody is watching,

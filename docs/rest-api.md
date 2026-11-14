@@ -47,6 +47,9 @@ one can control it.
 | POST | `/api/identify` | `{"seconds": 1-60}` |
 | POST | `/api/alert` | `{"seconds": 30}` |
 | POST | `/api/alert/clear` | — |
+| GET | `/api/sequences` | — |
+| POST | `/api/sequence` | `{"sequence": "ocean", "fade": 3, "color": "#0080ff"}` |
+| POST | `/api/pulse` | `{"ms": 600, "brightness": 255}` |
 | GET | `/api/effects` | — |
 | POST | `/api/effect` | `{"effect": "...", "colors": [...], "seconds": 300}` |
 | POST | `/api/effect/reset` | — |
@@ -91,7 +94,36 @@ This is the REST twin of the MQTT alert topic, which is how Home Assistant fires
 one; see [mqtt.md](mqtt.md). It exists so an alert can be tested and fired with
 no broker involved, including when the broker is the thing that has gone wrong.
 
+### Sequences
+
+```sh
+curl http://lamp.local/api/sequences
+curl -X POST 'http://lamp.local/api/sequence?sequence=ocean'
+curl -X POST 'http://lamp.local/api/sequence?sequence=party&fade=0'
+curl -X POST 'http://lamp.local/api/sequence?color=%23ff4000'   # breathe, in this color
+```
+
+The named looks — `vibrant`, `ocean`, `sunset`, `aurora`, `spectrum`, `party`,
+`breathe`, `ember` — and how lamps keep them in step are described in
+[mqtt.md](mqtt.md#sequences). Selecting one persists it and cross-fades over
+`fade` seconds (0–30, default 3). `color` sets breathe's color and, without a
+`sequence`, selects breathe. Selecting a sequence clears any custom effect.
+
+### Pulse
+
+```sh
+curl -X POST http://lamp.local/api/pulse
+curl -X POST 'http://lamp.local/api/pulse?ms=1000&brightness=200'
+```
+
+Jumps to `brightness` (default 255) and eases back over `ms` (default 600,
+100–5000). Nothing is saved. Ignored while the lamp is off. The REST twin of
+the MQTT pulse topics.
+
 ### Effects
+
+Custom effects: your own palette on one of four movements, shown over the
+sequence for a while.
 
 ```sh
 curl http://lamp.local/api/effects
@@ -101,7 +133,7 @@ curl -X POST http://lamp.local/api/effect/reset
 
 | Effect | What it does |
 |---|---|
-| `blend` | The whole ring holds one color and eases to the next. The default. |
+| `blend` | The whole ring holds one color and eases to the next. |
 | `loop` | Walks the palette steadily, never resting on a color. |
 | `flicker` | Similar colors mixing and guttering, like a flame. |
 | `neon` | One color at full brightness, held steady, switching cleanly to the next. |
@@ -123,9 +155,8 @@ the lamp is already showing, so switching effect is a one-field call.
 `seconds` defaults to **300** and is capped at **28800** (8 hours); a larger
 value is clamped rather than refused. `0` means until the lamp reboots.
 
-**Effects are deliberately temporary.** When one expires the lamp returns to
-blending its five default colors, and nothing persists an effect across a
-reboot — a lamp that loses power comes back showing what it is supposed to show
+**Effects are deliberately temporary.** When one expires the lamp fades back
+to its sequence, and nothing persists an effect across a reboot — a lamp that loses power comes back showing what it is supposed to show
 rather than whatever someone was trying last week.
 
 Colors are rendered as hue and saturation, not RGB, and transitions travel the
@@ -191,6 +222,9 @@ rather than off.
   "brightness": 64,
   "color": "#6f9044",
   "identifying": false,
+  "pulsing": false,
+  "sequence": {"name": "vibrant", "fading": false, "breathe_color": "#0080ff"},
+  "clock": {"synced": true, "error_ms": 0},
   "effect": {
     "name": "blend",
     "default": true,
@@ -208,7 +242,12 @@ rather than off.
 | `color` | What the ring is actually lit with, before brightness scaling — black when the lamp is off, red during an alert. |
 | `diagnostics.effect_color` | What the effect is on underneath, which differs whenever an overlay is running or the lamp is off. |
 | `diagnostics.dark_because` | Why the ring is dark, or empty when lit. |
-| `effect.expires_in` | Seconds until it reverts. `-1` when the default is running or the effect lasts until reboot. |
+| `effect.name` | The custom effect while one is set, otherwise the sequence. |
+| `effect.default` | `true` while the sequence, not a custom effect, is showing. |
+| `effect.expires_in` | Seconds until it reverts. `-1` when the sequence is showing or the effect lasts until reboot. |
+| `sequence.fading` | `true` while one look is cross-fading into another. |
+| `clock.synced` | Whether NTP time has arrived. Until it has, the lamp runs on its own and is not in step with others. |
+| `clock.error_ms` | How far the lamp still has to steer to be in step. Settles near 0. |
 | `ota.state` | `idle`, `checking`, `installing` or `error`. |
 | `ota.checked` | Seconds since the last completed check, `-1` if none this boot. |
 

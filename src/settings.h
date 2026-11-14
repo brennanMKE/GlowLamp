@@ -40,6 +40,11 @@ public:
     uint8_t brightness() const { return bright; }
     bool power() const { return on; }
 
+    // The selected sequence, by name (see sequences.h), and breathe's color as
+    // 0xRRGGBB. Both survive a power cut, like brightness and power.
+    const String &sequence() const { return seqName; }
+    uint32_t breatheColor() const { return breathe; }
+
     // The broker. An empty host means MQTT is off, which is the default and a
     // fully supported way to run a lamp -- see docs/home-assistant-control.md.
     const String &mqttHost() const { return broker; }
@@ -52,6 +57,8 @@ public:
     // that comes back on by itself in the middle of the night.
     void saveBrightness(uint8_t value);
     void savePower(bool value);
+    void saveSequence(const String &name);
+    void saveBreatheColor(uint32_t rgb);
     void saveNames(const String &newLabel, const String &newHost);
     void saveBroker(const String &host, uint16_t port, const String &user, const String &pass);
 
@@ -62,6 +69,8 @@ private:
     String label;
     uint8_t bright = 64;
     bool on = true;
+    String seqName = "vibrant";
+    uint32_t breathe = 0x0080ff;
     String broker;
     uint16_t brokerPort = 1883;
     String brokerUser;
@@ -90,6 +99,9 @@ private:
     void handleApiEffect();
     void handleApiEffectReset();
     void handleApiEffects();
+    void handleApiSequence();
+    void handleApiSequences();
+    void handleApiPulse();
     void handleApiName();
     void handleApiBroker();
     void handleApiOtaCheck();

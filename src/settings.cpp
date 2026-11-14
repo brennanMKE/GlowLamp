@@ -12,6 +12,7 @@
 #include "logbuf.h"
 #include "mqtt.h"
 #include "ota.h"
+#include "sequences.h"
 #include "version.h"
 #include "wifi_link.h"
 
@@ -42,14 +43,16 @@ void LampSettings::begin() {
     label = p.isKey("label") ? p.getString("label") : host;
     if (p.isKey("bright")) bright = p.getUChar("bright");
     if (p.isKey("power")) on = p.getBool("power");
+    if (p.isKey("seq")) seqName = p.getString("seq");
+    if (p.isKey("breathe")) breathe = p.getUInt("breathe");
     broker = p.isKey("mqtt_host") ? p.getString("mqtt_host") : String(MQTT_HOST);
     brokerPort = p.isKey("mqtt_port") ? p.getUShort("mqtt_port") : MQTT_PORT;
     brokerUser = p.isKey("mqtt_user") ? p.getString("mqtt_user") : String(MQTT_USER);
     brokerPass = p.isKey("mqtt_pass") ? p.getString("mqtt_pass") : String(MQTT_PASS);
     p.end();
 
-    ESP_LOGI(TAG, "host=%s label=%s brightness=%u power=%s broker=%s", host.c_str(),
-             label.c_str(), bright, on ? "on" : "off",
+    ESP_LOGI(TAG, "host=%s label=%s brightness=%u power=%s sequence=%s broker=%s",
+             host.c_str(), label.c_str(), bright, on ? "on" : "off", seqName.c_str(),
              broker.length() ? broker.c_str() : "(none)");
 }
 
@@ -66,6 +69,24 @@ void LampSettings::savePower(bool value) {
     Preferences p;
     p.begin(NVS_NS, false);
     p.putBool("power", on);
+    p.end();
+}
+
+void LampSettings::saveSequence(const String &name) {
+    if (name == seqName) return;  // a repeated command should not wear the flash
+    seqName = name;
+    Preferences p;
+    p.begin(NVS_NS, false);
+    p.putString("seq", seqName);
+    p.end();
+}
+
+void LampSettings::saveBreatheColor(uint32_t rgb) {
+    if (rgb == breathe) return;
+    breathe = rgb;
+    Preferences p;
+    p.begin(NVS_NS, false);
+    p.putUInt("breathe", breathe);
     p.end();
 }
 
@@ -164,6 +185,9 @@ void LampSettings::registerRoutes() {
     server.on("/api/effects", HTTP_GET, std::bind(&LampSettings::handleApiEffects, this));
     server.on("/api/effect", HTTP_POST, std::bind(&LampSettings::handleApiEffect, this));
     server.on("/api/effect/reset", HTTP_POST, std::bind(&LampSettings::handleApiEffectReset, this));
+    server.on("/api/sequences", HTTP_GET, std::bind(&LampSettings::handleApiSequences, this));
+    server.on("/api/sequence", HTTP_POST, std::bind(&LampSettings::handleApiSequence, this));
+    server.on("/api/pulse", HTTP_POST, std::bind(&LampSettings::handleApiPulse, this));
     server.on("/api/name", HTTP_POST, std::bind(&LampSettings::handleApiName, this));
     server.on("/api/broker", HTTP_POST, std::bind(&LampSettings::handleApiBroker, this));
     server.on("/api/ota/check", HTTP_POST, std::bind(&LampSettings::handleApiOtaCheck, this));
@@ -279,6 +303,21 @@ String LampSettings::statusJson(bool pretty) const {
     JsonObject alert = doc["alert"].to<JsonObject>();
     alert["active"] = lampAlerting();
     alert["remaining"] = lampAlertRemaining();
+
+    doc["pulsing"] = lampPulsing();
+
+    JsonObject sequence = doc["sequence"].to<JsonObject>();
+    sequence["name"] = lampSequenceName();
+    sequence["fading"] = lampFading();
+    char breatheHex[8];
+    snprintf(breatheHex, sizeof(breatheHex), "#%06lx", (unsigned long)lampBreatheColor());
+    sequence["breathe_color"] = breatheHex;
+
+    // Whether this lamp has NTP time and so is in step with the others, and
+    // how much catching up it still has to do.
+    JsonObject clock = doc["clock"].to<JsonObject>();
+    clock["synced"] = lampClockSynced();
+    clock["error_ms"] = lampClockErrorMs();
 
     JsonObject effect = doc["effect"].to<JsonObject>();
     effect["name"] = lampEffectName();
@@ -408,11 +447,16 @@ void LampSettings::handleApiIndex() {
         "Pulse red to get attention. Overrides the effect, the brightness and the power "
         "state, then restores them. Always expires.");
     add("POST", "/api/alert/clear", "", "Stop an alert now.");
-    add("GET", "/api/effects", "", "The effects this firmware can render, and the limits.");
+    add("GET", "/api/sequences", "", "The named sequences, and which one is selected.");
+    add("POST", "/api/sequence", "{\"sequence\": \"ocean\", \"fade\": 3, \"color\": \"#0080ff\"}",
+        "Select a sequence and fade to it. Persists. `color` sets breathe's color.");
+    add("POST", "/api/pulse", "{\"ms\": 600, \"brightness\": 255}",
+        "Briefly raise the brightness, then ease back. Ignored while the lamp is off.");
+    add("GET", "/api/effects", "", "The custom effects this firmware can render, and the limits.");
     add("POST", "/api/effect",
         "{\"effect\": \"blend\", \"colors\": [\"#ff0000\"], \"seconds\": 300}",
-        "Set the effect and palette. Reverts to the default when it expires.");
-    add("POST", "/api/effect/reset", "", "Back to the default effect and palette now.");
+        "Show a custom effect and palette instead of the sequence. Reverts when it expires.");
+    add("POST", "/api/effect/reset", "", "Back to the sequence now.");
     add("POST", "/api/name", "{\"name\": \"Living Room\", \"hostname\": \"glow-lamp\"}",
         "Rename. A changed hostname needs a reboot to take effect.");
     add("POST", "/api/ota/check", "", "Ask GitHub for the latest release. Installs nothing.");
@@ -640,8 +684,83 @@ void LampSettings::handleApiEffect() {
     sendStatus();
 }
 
+// The sequences, so an automation does not have to guess at the names.
+void LampSettings::handleApiSequences() {
+    WebServer &server = configServer.getServer();
+
+    JsonDocument doc;
+    JsonArray list = doc["sequences"].to<JsonArray>();
+    for (uint8_t i = 0; i < SEQUENCE_COUNT; i++) {
+        JsonObject e = list.add<JsonObject>();
+        e["name"] = SEQUENCES[i].name;
+        e["description"] = SEQUENCE_DESCRIPTIONS[i];
+        // Whether two lamps on it show the same thing. Only flicker does not.
+        e["synced"] = SEQUENCES[i].mode != EFFECT_FLICKER;
+    }
+    doc["current"] = lampSequenceName();
+
+    String out;
+    serializeJsonPretty(doc, out);
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(200, "application/json", out);
+}
+
+void LampSettings::handleApiSequence() {
+    WebServer &server = configServer.getServer();
+    Params p(server);
+
+    String wanted = p.str("sequence", p.str("name"));
+    wanted.trim();
+    uint8_t index = findSequence(wanted.c_str());
+    if (index == SEQUENCE_COUNT && !p.has("color")) {
+        String names;
+        for (uint8_t i = 0; i < SEQUENCE_COUNT; i++) {
+            if (i) names += ", ";
+            names += SEQUENCES[i].name;
+        }
+        server.send(400, "application/json",
+                    "{\"error\":\"sequence must be one of: " + names + "\"}");
+        return;
+    }
+
+    // A color is breathe's color. Sent alone it also selects breathe, which is
+    // what Home Assistant's color picker does over MQTT.
+    if (p.has("color")) {
+        uint32_t rgb;
+        if (!parseHexColor(p.str("color"), rgb)) {
+            server.send(400, "application/json", "{\"error\":\"color must be hex like #0080ff\"}");
+            return;
+        }
+        setLampBreatheColor(rgb);
+        saveBreatheColor(rgb);
+        if (index == SEQUENCE_COUNT) index = SEQ_BREATHE;
+    }
+
+    // Seconds, because that is what an automation author thinks in. 0 switches
+    // at once; 30 is long enough for anything deliberate.
+    long fade = p.has("fade") ? p.num("fade", 3) : 3;
+    if (fade < 0) fade = 0;
+    if (fade > 30) fade = 30;
+
+    setLampSequence(index, (uint32_t)fade * 1000UL);
+    saveSequence(SEQUENCES[index].name);
+    sendStatus();
+}
+
+// REST parity with the MQTT pulse topics.
+void LampSettings::handleApiPulse() {
+    Params p(configServer.getServer());
+    long ms = p.has("ms") ? p.num("ms", 0) : 0;
+    long level = p.has("brightness") ? p.num("brightness", 255) : 255;
+    if (ms < 0) ms = 0;
+    if (level < 1) level = 1;
+    if (level > 255) level = 255;
+    pulseLamp((uint32_t)ms, (uint8_t)level);
+    sendStatus();
+}
+
 void LampSettings::handleApiEffectReset() {
-    ESP_LOGI(TAG, "effect reset to the default");
+    ESP_LOGI(TAG, "custom effect cleared, back to the sequence");
     resetLampEffect();
     sendStatus();
 }
@@ -883,6 +1002,7 @@ static String controlsHtml() {
     b += "<div class='button-group'>";
     b += "<button id='powerbtn' class='button primary'>&hellip;</button>";
     b += "<button id='idbtn' class='button'>Identify</button>";
+    b += "<button id='pulsebtn' class='button'>Pulse</button>";
     b += "</div>";
     b += "<div class='form-group'>";
     b += "<label for='bslider'>Brightness <span id='bval'>&hellip;</span> / 255</label>";
@@ -913,12 +1033,16 @@ static String controlsJs() {
         "post('/api/power',{on:'toggle'}).then(render);};"
         "document.getElementById('idbtn').onclick=function(){"
         "post('/api/identify',{seconds:4}).then(render);};"
+        "document.getElementById('pulsebtn').onclick=function(){"
+        "post('/api/pulse',{}).then(render);};"
         "function render(s){"
         "if(!s)return;"
         "var pb=document.getElementById('powerbtn');"
         "pb.textContent=s.on?'Turn off':'Turn on';"
         "pb.className='button '+(s.on?'primary':'');"
         "document.getElementById('idbtn').disabled=!!s.identifying;"
+        // A pulse is ignored while the lamp is off, so the button says so.
+        "document.getElementById('pulsebtn').disabled=!s.on;"
         // Not while dragging: overwriting the thumb under the finger makes the
         // slider fight back.
         "if(!dragging){slider.value=s.brightness;"
@@ -989,7 +1113,8 @@ void LampSettings::handleHome() {
     b += "<tr><th>Color</th><td><span id='swatch' style='background:" + lampColorHex() +
          "'></span><span id='color'>" + lampColorHex() + "</span></td></tr>";
     b += rowId("State", lampPower() ? "on" : "off", "state");
-    b += rowId("Effect", lampEffectName(), "effect");
+    b += rowId("Showing", lampEffectName(), "effect");
+    b += rowId("Clock", lampClockSynced() ? "in step" : "waiting for NTP", "clock");
     b += rowId("MQTT", mqttEnabled() ? (mqttConnected() ? "connected" : "connecting") : "off",
                "mqtt");
     b += "</table>";
@@ -1033,7 +1158,9 @@ void LampSettings::handleHome() {
          "?\"<div class='status warning'>The ring is dark: \"+s.diagnostics.dark_because+"
          "\".</div>\":'';"
          "document.getElementById('effect').textContent="
-         "s.effect.name+(s.effect.default?'':' (reverting)');"
+         "s.effect.name+(s.effect.default?'':' (custom, reverting)');"
+         "document.getElementById('clock').textContent="
+         "s.clock.synced?'in step':'waiting for NTP';"
          "document.getElementById('mqtt').textContent="
          "s.mqtt.enabled?(s.mqtt.connected?'connected':'connecting'):'off';"
          "document.getElementById('rssi').textContent="
@@ -1058,7 +1185,27 @@ void LampSettings::handleEffectsPage() {
     b += controlsHtml();
 
     b += "<hr>";
-    b += "<h2>Effect</h2>";
+    b += "<h2>Sequence</h2>";
+    b += "<p style='font-size:14px;color:#888'>What this lamp shows, kept across power cuts. "
+         "Every lamp on the same sequence shows the same color at the same moment, "
+         "except ember, which flickers on its own.</p>";
+    b += "<div id='seqbuttons'>";
+    for (uint8_t i = 0; i < SEQUENCE_COUNT; i++) {
+        b += "<button class='fx' data-seq='" + String(SEQUENCES[i].name) + "'>";
+        b += "<b>" + String(SEQUENCES[i].name) + "</b><span>" + SEQUENCE_DESCRIPTIONS[i] +
+             "</span>";
+        b += "</button>";
+    }
+    b += "</div>";
+    b += "<div class='form-group' style='margin-top:12px'>";
+    b += "<label for='breathe'>Breathe color</label>";
+    b += "<input type='color' id='breathe'>";
+    b += "</div>";
+
+    b += "<hr>";
+    b += "<h2>Custom effect</h2>";
+    b += "<p style='font-size:14px;color:#888'>Try out your own palette for a while. It "
+         "shows instead of the sequence and reverts to it on its own.</p>";
     // Buttons rather than a dropdown: four options that each need a sentence of
     // explanation are a poor fit for a control that shows one of them at a time.
     const char *what[EFFECT_COUNT] = {
@@ -1117,14 +1264,14 @@ void LampSettings::handleEffectsPage() {
     b += "<option value='28800'>8 hours</option>";
     b += "<option value='0'>until the lamp reboots</option>";
     b += "</select>";
-    b += "<small>An effect is temporary on purpose. When it expires the lamp goes back "
-         "to blending its five default colors, and nothing here survives a reboot.</small>";
+    b += "<small>A custom effect is temporary on purpose. When it expires the lamp goes "
+         "back to its sequence, and nothing here survives a reboot.</small>";
     b += "</div>";
 
     b += "<div id='fxstate'></div>";
     b += "<div class='button-group'>";
     b += "<button id='applyfx' class='button primary'>Apply</button>";
-    b += "<button id='resetfx' class='button'>Back to default</button>";
+    b += "<button id='resetfx' class='button'>Back to the sequence</button>";
     b += "</div>";
 
     b += "<div class='button-group'>";
@@ -1136,11 +1283,11 @@ void LampSettings::handleEffectsPage() {
     b += controlsJs();
     b += "var fxTouched=false,chosen='blend';"
          "function mark(){"
-         "var bs=document.querySelectorAll('.fx');"
+         "var bs=document.querySelectorAll('#fxbuttons .fx');"
          "for(var i=0;i<bs.length;i++){"
          "bs[i].className='fx'+(bs[i].dataset.fx==chosen?' on':'');}"
          "}"
-         "var fxb=document.querySelectorAll('.fx');"
+         "var fxb=document.querySelectorAll('#fxbuttons .fx');"
          "for(var i=0;i<fxb.length;i++){fxb[i].onclick=function(){"
          "chosen=this.dataset.fx;fxTouched=true;mark();apply();};}"
          "var pb=document.querySelectorAll('.preset');"
@@ -1171,8 +1318,8 @@ void LampSettings::handleEffectsPage() {
          "fxTouched=false;render(s);fxRender(s.effect);});};"
          "function fxRender(f){"
          "var box=document.getElementById('fxstate');"
-         "if(f.default){box.innerHTML=\"<div class='status success'>Showing the default: \"+"
-         "f.name+\"</div>\";}"
+         "if(f.default){box.innerHTML=\"<div class='status success'>Showing the sequence\"+"
+         "\"</div>\";}"
          "else if(f.expires_in<0){box.innerHTML=\"<div class='status warning'>\"+f.name+"
          "\", until the lamp reboots</div>\";}"
          "else{var m=Math.floor(f.expires_in/60),sec=f.expires_in%60;"
@@ -1189,8 +1336,22 @@ void LampSettings::handleEffectsPage() {
          "document.getElementById('u'+i).checked=has;"
          "if(has)document.getElementById('c'+i).value=sel.colors[i];}"
          "}"
+         // Sequence buttons apply at once and persist; the breathe picker sets
+         // the color and selects breathe, as Home Assistant's picker does.
+         "var sqb=document.querySelectorAll('#seqbuttons .fx');"
+         "for(var i=0;i<sqb.length;i++){sqb[i].onclick=function(){"
+         "post('/api/sequence',{sequence:this.dataset.seq}).then(function(s){"
+         "render(s);seqRender(s);fxRender(s.effect);});};}"
+         "var br=document.getElementById('breathe'),brTouched=false;"
+         "br.oninput=function(){brTouched=true;};"
+         "br.onchange=function(){post('/api/sequence',{color:br.value}).then(function(s){"
+         "brTouched=false;render(s);seqRender(s);fxRender(s.effect);});};"
+         "function seqRender(s){"
+         "for(var i=0;i<sqb.length;i++){"
+         "sqb[i].className='fx'+(sqb[i].dataset.seq==s.sequence.name?' on':'');}"
+         "if(!brTouched)br.value=s.sequence.breathe_color;}"
          "function u(){fetch('/api/status?pretty=0',{cache:'no-store'}).then(r=>r.json())"
-         ".then(s=>{render(s);fxRender(s.effect);}).catch(()=>{});}"
+         ".then(s=>{render(s);seqRender(s);fxRender(s.effect);}).catch(()=>{});}"
          "setInterval(u,1000);u();"
          "</script>";
 

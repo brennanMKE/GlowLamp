@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <FastLED.h>
 #include <esp_log.h>
+#include <sys/time.h>
 
 #include "every_n_millis.h"
 #include "effects.h"
@@ -8,6 +9,7 @@
 #include "logbuf.h"
 #include "mqtt.h"
 #include "ota.h"
+#include "sequences.h"
 #include "settings.h"
 #include "version.h"
 #include "wifi_link.h"
@@ -22,30 +24,28 @@ static const char *TAG = "LAMP";
 #define DATA_PIN 4
 #define NUM_LEDS 8
 
-// ===== Default palette =====
-//
-// Five colors, as hue and saturation. Given as hues rather than RGB triples
-// because that is what the renderers blend in, and because a hue is the one
-// form that cannot accidentally be pale: saturation 255 is vivid by
-// construction, whatever the hue.
-//
-// Spaced 40-56 apart around the wheel so no two are close enough to read as
-// the same color on a ring this small. Deliberately no white, no amber and no
-// pastel: on a WS2812B those wash out, and the whole point of the palette is
-// that the lamp is never showing something that looks like a dirty bulb.
-static const PaletteColor DEFAULT_PALETTE[] = {
-    {0, 255},    // red
-    {40, 255},   // gold
-    {96, 255},   // green
-    {150, 255},  // azure
-    {200, 255},  // magenta
-};
-static const uint8_t DEFAULT_PALETTE_SIZE =
-    sizeof(DEFAULT_PALETTE) / sizeof(DEFAULT_PALETTE[0]);
+// ===== Sequences =====
+// The built-in looks live in sequences.h. This is how long switching between
+// two of them takes, and the custom effects' (shorter, because someone is
+// sitting at the effects page waiting to see what they picked).
+static const uint32_t SEQUENCE_FADE_MS = 3000;
+static const uint32_t CUSTOM_FADE_MS = 1500;
+
+// Breathe's color until Home Assistant's color picker sets one: the azure the
+// vibrant palette already uses.
+static const uint32_t DEFAULT_BREATHE_RGB = 0x0080ff;
+
+// ===== Pulse =====
+// A moment of extra brightness that Home Assistant fires on an event. Jumps to
+// the peak and eases back to the configured brightness; nothing is saved.
+static const uint32_t PULSE_DEFAULT_MS = 600;
+static const uint32_t PULSE_MIN_MS = 100;
+static const uint32_t PULSE_MAX_MS = 5000;
 
 // ===== Timing =====
-// Milliseconds to cross from one palette color to the next, so a full blend
-// cycle is BLEND_MS * colorCount -- 30 seconds on the five defaults. Slow on
+// The custom effects (REST and the effects page). Milliseconds to cross from
+// one palette color to the next, so a full blend cycle is BLEND_MS * colorCount
+// -- 30 seconds on five colors. Slow on
 // purpose: at a few seconds per leg the ring reads as a color-changing lamp,
 // much faster and it reads as an effect.
 static const uint32_t BLEND_MS = 6000;
@@ -117,8 +117,56 @@ static uint32_t alertEnd = 0;
 // brightness is 0 would come back from a reboot at full blast.
 static uint8_t appliedBrightness = 255;
 
-static EffectState fx;
+// ===== What is being drawn =====
+//
+// Two layers, so one sequence can cross-fade into the next. `layers[current]`
+// is what is showing; the other is what is coming in while `fading`.
+struct Layer {
+    Sequence seq;
+    FlickerState flicker;
+};
+static Layer layers[2];
+static uint8_t current = 0;
+
+static bool fading = false;
+static uint64_t fadeStart = 0;  // on the shared clock, not millis()
+static uint32_t fadeMs = 0;
+
+// The saved sequence, and the color breathe uses.
+static uint8_t sequenceIndex = 0;
+static uint32_t breatheRgb = DEFAULT_BREATHE_RGB;
+
+// A custom effect from the REST API or the effects page, showing instead of
+// the sequence until it expires. effectIsDefault is false while it is.
+static Sequence customSeq;
 static uint8_t effectMode = EFFECT_BLEND;
+
+// ===== The shared clock =====
+//
+// Milliseconds since 1970 once NTP has answered, which is what makes two lamps
+// that never talk to each other show the same color: they are both drawing
+// the same moment. Before NTP answers it is simply uptime, and the lamp runs
+// on its own until it can join in.
+//
+// It is NEVER set straight from the wall clock. It advances by the frame time
+// and is steered towards the wall clock -- by whole cycles when it is far off,
+// which looks like nothing, then by speeding up or slowing down the rest of
+// the way. Setting it would snap the color every time NTP corrected the clock.
+static uint64_t clockMs = 0;
+static bool clockSynced = false;
+static int32_t clockErrorMs = 0;
+
+// Anything earlier than late 2023 is the ESP32's own idea of time before NTP,
+// which starts at 1970.
+static const uint64_t WALL_PLAUSIBLE_MS = 1700000000000ULL;
+
+// What was last chosen in the custom effect controls, kept apart from what is
+// rendering. Reverting to the sequence changes the lamp, not the choice --
+// otherwise "back to the sequence" would quietly throw away a palette that
+// took a minute to pick.
+static uint8_t selectedMode = EFFECT_BLEND;
+static uint32_t selectedRgb[MAX_COLORS];
+static uint8_t selectedCount = 0;
 
 // What the API reports back, kept alongside the hue/saturation the renderers
 // use so a caller reading its colors back sees the values it sent rather than
@@ -130,19 +178,27 @@ static bool effectIsDefault = true;
 static bool effectHasExpiry = false;
 static uint32_t effectExpiresAt = 0;
 
-// The last thing someone chose, kept apart from what is rendering. Reverting
-// to the default changes the lamp, not the choice -- otherwise "back to
-// default" would quietly throw away a palette that took a minute to pick.
-static uint8_t selectedMode = EFFECT_BLEND;
-static uint32_t selectedRgb[MAX_COLORS];
-static uint8_t selectedCount = 0;
+static bool pulsing = false;
+static uint32_t pulseStart = 0;
+static uint32_t pulseMs = 0;
+static uint8_t pulseLevel = 0;
 
 uint8_t lampBrightness() { return brightness; }
 bool lampPower() { return power; }
 bool lampIdentifying() { return identifying; }
 uint8_t lampEffectMode() { return effectMode; }
-const char *lampEffectName() { return EFFECT_NAMES[effectMode]; }
+const char *lampEffectName() {
+    return effectIsDefault ? SEQUENCES[sequenceIndex].name : EFFECT_NAMES[effectMode];
+}
 bool lampEffectIsDefault() { return effectIsDefault; }
+
+uint8_t lampSequence() { return sequenceIndex; }
+const char *lampSequenceName() { return SEQUENCES[sequenceIndex].name; }
+uint32_t lampBreatheColor() { return breatheRgb; }
+bool lampFading() { return fading; }
+bool lampClockSynced() { return clockSynced; }
+int32_t lampClockErrorMs() { return clockErrorMs; }
+bool lampPulsing() { return pulsing; }
 
 void setLampBrightness(uint8_t value) {
     // Only ever records the setting. What reaches FastLED is decided in
@@ -183,6 +239,25 @@ int32_t lampAlertRemaining() {
     return (int32_t)((alertEnd - now) / 1000);
 }
 
+bool pulseLamp(uint32_t ms, uint8_t level) {
+    // An off lamp stays dark. A pulse is "look, something happened" on a lamp
+    // someone is already looking at, not a reason to light one they turned off.
+    if (!power) {
+        ESP_LOGI(TAG, "pulse ignored, the lamp is off");
+        return false;
+    }
+    if (ms == 0) ms = PULSE_DEFAULT_MS;
+    if (ms < PULSE_MIN_MS) ms = PULSE_MIN_MS;
+    if (ms > PULSE_MAX_MS) ms = PULSE_MAX_MS;
+    if (level == 0) level = 255;
+    pulseStart = millis();
+    pulseMs = ms;
+    pulseLevel = level;
+    pulsing = true;
+    ESP_LOGI(TAG, "pulse to %u over %lums", level, (unsigned long)ms);
+    return true;
+}
+
 static String hex(const CRGB &c) {
     char buf[8];
     snprintf(buf, sizeof(buf), "#%02x%02x%02x", c.r, c.g, c.b);
@@ -208,65 +283,144 @@ const char *lampDarkReason() {
     return "";
 }
 
-// Applying a palette resets the per-LED timers with it. Without this, the LEDs
-// a flicker effect had already scheduled would keep their old deadlines and
-// the new palette would arrive one LED at a time over the following second.
-static void applyPalette(const PaletteColor *colors, uint8_t count) {
-    fx.colorCount = count;
-    for (uint8_t i = 0; i < count; i++) fx.colors[i] = colors[i];
+static uint32_t packRgb(const CRGB &c) {
+    return ((uint32_t)c.r << 16) | ((uint32_t)c.g << 8) | c.b;
+}
 
-    uint32_t now = millis();
-    for (uint8_t i = 0; i < NUM_LEDS; i++) fx.timeouts[i] = now;
-    fx.hueTimeout = now + 3000;
-    fx.hueIndex = 0;
+static uint32_t paletteToRgb(const PaletteColor &c) { return packRgb(CRGB(CHSV(c.h, c.s, 255))); }
+
+static PaletteColor rgbToPalette(uint32_t color) {
+    CRGB rgb((color >> 16) & 0xFF, (color >> 8) & 0xFF, color & 0xFF);
+    // rgb2hsv_approximate is lossy, which is exactly why the original 0xRRGGBB
+    // is kept for reporting. What matters here is that the renderers get a hue
+    // they can travel along without crossing gray.
+    CHSV hsv = rgb2hsv_approximate(rgb);
+    PaletteColor out;
+    out.h = hsv.h;
+    // A color dark enough to have no meaningful hue -- near-black -- would
+    // otherwise render as an arbitrary one at full saturation. Treating it as
+    // unsaturated lets it read as the dim white it is.
+    out.s = hsv.v < 16 ? 0 : hsv.s;
+    return out;
+}
+
+// The saved sequence, with breathe's color filled in.
+static void builtInSequence(Sequence &out) {
+    out = SEQUENCES[sequenceIndex];
+    if (sequenceIndex == SEQ_BREATHE) out.colors[0] = rgbToPalette(breatheRgb);
+}
+
+uint32_t lampSequenceColor() {
+    if (sequenceIndex == SEQ_BREATHE) return breatheRgb;
+    return paletteToRgb(SEQUENCES[sequenceIndex].colors[0]);
+}
+
+// Bring in whatever should now be showing: the custom effect if one is set,
+// the saved sequence otherwise.
+//
+// The fade starts on a whole second of the shared clock, at least half a
+// second out. A command sent to every lamp at once reaches them tens of
+// milliseconds apart; starting on the same second is what makes them fade
+// together rather than one after another.
+static void showWanted(uint32_t fade) {
+    if (fading) {
+        // Already mid-fade: whatever was coming in becomes what is showing.
+        // Before it had started, the old layer is still the right one.
+        if (clockMs >= fadeStart) current ^= 1;
+        fading = false;
+    }
+
+    Layer &next = layers[current ^ 1];
+    if (effectIsDefault) {
+        builtInSequence(next.seq);
+    } else {
+        next.seq = customSeq;
+    }
+    resetFlicker(next.flicker, millis());
+
+    if (fade == 0) {
+        current ^= 1;
+        return;
+    }
+    fadeStart = ((clockMs + 500) / 1000 + 1) * 1000;
+    fadeMs = fade;
+    fading = true;
+}
+
+// effectRgb describes the sequence while no custom effect is set, so a caller
+// switching effect with no colors gets the palette they can see.
+static void reportSequenceColors() {
+    const Sequence &s = SEQUENCES[sequenceIndex];
+    if (sequenceIndex == SEQ_BREATHE) {
+        effectRgb[0] = breatheRgb;
+        effectRgbCount = 1;
+    } else {
+        effectRgbCount = s.count < MAX_COLORS ? s.count : MAX_COLORS;
+        for (uint8_t i = 0; i < effectRgbCount; i++) effectRgb[i] = paletteToRgb(s.colors[i]);
+    }
+    effectMode = s.mode < EFFECT_COUNT ? s.mode : EFFECT_BLEND;
+
+    // Only seeds the selection when nothing has been chosen yet -- at boot. A
+    // reset after that leaves the stored choice untouched, which is the whole
+    // point of keeping the two apart.
+    if (selectedCount == 0) {
+        for (uint8_t i = 0; i < effectRgbCount; i++) selectedRgb[i] = effectRgb[i];
+        selectedCount = effectRgbCount;
+        selectedMode = EFFECT_BLEND;
+    }
+}
+
+bool setLampSequence(uint8_t index, uint32_t fade) {
+    if (index >= SEQUENCE_COUNT) return false;
+    sequenceIndex = index;
+    effectIsDefault = true;
+    effectHasExpiry = false;
+    reportSequenceColors();
+    showWanted(fade);
+    ESP_LOGI(TAG, "sequence %s, fading over %lums", SEQUENCES[index].name, (unsigned long)fade);
+    return true;
+}
+
+bool setLampSequence(uint8_t index) { return setLampSequence(index, SEQUENCE_FADE_MS); }
+
+void setLampBreatheColor(uint32_t rgb) {
+    breatheRgb = rgb & 0xFFFFFF;
+    // Only redraws when breathe is what is showing; otherwise it is stored for
+    // the next time someone picks it.
+    if (sequenceIndex == SEQ_BREATHE) {
+        reportSequenceColors();
+        if (effectIsDefault) showWanted(SEQUENCE_FADE_MS);
+    }
 }
 
 void resetLampEffect() {
-    effectMode = EFFECT_BLEND;
-    applyPalette(DEFAULT_PALETTE, DEFAULT_PALETTE_SIZE);
-
-    // Report the defaults in the same form a caller would have sent them.
-    for (uint8_t i = 0; i < DEFAULT_PALETTE_SIZE; i++) {
-        CRGB rgb = CHSV(DEFAULT_PALETTE[i].h, DEFAULT_PALETTE[i].s, 255);
-        effectRgb[i] = ((uint32_t)rgb.r << 16) | ((uint32_t)rgb.g << 8) | rgb.b;
-    }
-    effectRgbCount = DEFAULT_PALETTE_SIZE;
-
-    // Only seeds the selection when nothing has been chosen yet -- at boot.
-    // A reset after that leaves the stored choice untouched, which is the
-    // whole point of keeping the two apart.
-    if (selectedCount == 0) {
-        for (uint8_t i = 0; i < DEFAULT_PALETTE_SIZE; i++) selectedRgb[i] = effectRgb[i];
-        selectedCount = DEFAULT_PALETTE_SIZE;
-        selectedMode = EFFECT_BLEND;
-    }
-
     effectIsDefault = true;
     effectHasExpiry = false;
+    reportSequenceColors();
+    showWanted(CUSTOM_FADE_MS);
 }
 
 bool setLampEffect(uint8_t mode, const uint32_t *colors, uint8_t count, uint32_t seconds) {
     if (mode >= EFFECT_COUNT) return false;
     if (count == 0 || count > MAX_COLORS) return false;
 
-    PaletteColor palette[MAX_COLORS];
+    // The custom effects run on the shared clock too, so two lamps given the
+    // same effect and palette over REST stay in step as well.
+    static const uint16_t LEG[EFFECT_COUNT] = {BLEND_MS, LOOP_LEG_MS, 1500, NEON_LEG_MS};
+    Sequence s = {};
+    s.name = EFFECT_NAMES[mode];
+    s.mode = mode;
+    s.count = count;
+    s.fadeMs = NEON_FADE_MS;
     for (uint8_t i = 0; i < count; i++) {
-        CRGB rgb((colors[i] >> 16) & 0xFF, (colors[i] >> 8) & 0xFF, colors[i] & 0xFF);
-        // rgb2hsv_approximate is lossy, which is exactly why the original
-        // 0xRRGGBB is kept for reporting. What matters here is that the
-        // renderers get a hue they can travel along without crossing gray.
-        CHSV hsv = rgb2hsv_approximate(rgb);
-        palette[i].h = hsv.h;
-        // A color dark enough to have no meaningful hue -- near-black -- would
-        // otherwise render as an arbitrary one at full saturation. Treating it
-        // as unsaturated lets it read as the dim white it is.
-        palette[i].s = hsv.v < 16 ? 0 : hsv.s;
+        s.colors[i] = rgbToPalette(colors[i]);
+        s.legMs[i] = LEG[mode];
         effectRgb[i] = colors[i];
     }
+    customSeq = s;
 
     effectMode = mode;
     effectRgbCount = count;
-    applyPalette(palette, count);
 
     // Remember it as the choice, so a later reset can be undone by eye.
     selectedMode = mode;
@@ -276,6 +430,7 @@ bool setLampEffect(uint8_t mode, const uint32_t *colors, uint8_t count, uint32_t
     effectIsDefault = false;
     effectHasExpiry = seconds > 0;
     effectExpiresAt = millis() + seconds * 1000UL;
+    showWanted(CUSTOM_FADE_MS);
 
     ESP_LOGI(TAG, "effect %s, %u colors, expires in %lus", EFFECT_NAMES[mode], count,
              (unsigned long)seconds);
@@ -301,6 +456,58 @@ int32_t lampEffectExpiresIn() {
     return (int32_t)((effectExpiresAt - now) / 1000);
 }
 
+// Advance the shared clock by one frame and steer it towards NTP time.
+static void advanceClock(uint32_t delta) {
+    clockMs += delta;
+
+    struct timeval tv;
+    gettimeofday(&tv, nullptr);
+    uint64_t wall = (uint64_t)tv.tv_sec * 1000ULL + (uint64_t)(tv.tv_usec / 1000);
+    if (wall < WALL_PLAUSIBLE_MS) return;  // NTP has not answered yet
+
+    if (!clockSynced) {
+        clockSynced = true;
+        ESP_LOGI(TAG, "clock synced, joining the shared sequence");
+    }
+
+    int64_t err = (int64_t)(wall - clockMs);
+
+    // Far off -- the first sync after boot, or NTP stepping the clock. Move by
+    // whole repeats of what is showing, which changes nothing on the ring, and
+    // leave at most half a repeat to steer out. Flicker does not follow the
+    // clock, so for it the whole difference is invisible.
+    uint32_t repeat = sequenceRepeatMs(layers[current].seq);
+    int64_t jump = 0;
+    if (repeat == 0) {
+        jump = err;
+    } else {
+        int64_t half = repeat / 2;
+        if (err > half || err < -half) {
+            int64_t r = (int64_t)repeat;
+            jump = (err >= 0 ? (err + half) / r : (err - half) / r) * r;
+        }
+    }
+    if (jump) {
+        clockMs += jump;
+        fadeStart += jump;  // a fade waiting to start stays the same distance away
+        err -= jump;
+    }
+
+    // Close: run up to half again as fast, or half as fast, until caught up.
+    // Never backwards, and a few ms either way is not worth chasing.
+    int64_t step = delta / 2;
+    if (step < 1) step = 1;
+    if (err > 2) {
+        clockMs += err < step ? err : step;
+    } else if (err < -2) {
+        clockMs -= -err < step ? -err : step;
+    }
+
+    if (err > INT32_MAX) err = INT32_MAX;
+    if (err < INT32_MIN) err = INT32_MIN;
+    clockErrorMs = (int32_t)err;
+}
+
 static void loopLeds() {
     static uint32_t lastFrame = 0;
 
@@ -309,43 +516,39 @@ static void loopLeds() {
     if (delta < FRAME_MS) return;
     lastFrame = now;
 
-    // An effect outlives its welcome by default, not by exception: anything set
-    // over the API reverts on its own, so a lamp left mid-experiment finds its
-    // way back without anyone remembering to put it there.
+    // A custom effect outlives its welcome by default, not by exception:
+    // anything set over the API reverts on its own, so a lamp left
+    // mid-experiment finds its way back without anyone remembering to put it
+    // there.
     if (effectHasExpiry && timeReached(now, effectExpiresAt)) {
-        ESP_LOGI(TAG, "effect expired, back to the default");
+        ESP_LOGI(TAG, "effect expired, back to the sequence");
         resetLampEffect();
     }
 
-    // Phase accumulates from elapsed time rather than being taken as
-    // millis() % cycle. The modulo form jumps at the millis() rollover -- a
-    // visible color snap once every 49.7 days -- because the wrap point is not
-    // a multiple of the cycle. Unsigned subtraction of two samples is exact
-    // across the wrap, so accumulating the difference is too.
-    fx.phase += delta;
+    advanceClock(delta);
 
-    // The effect renders whatever the lamp is doing, so power and identify only
-    // decide what reaches the LEDs. Switching back on resumes the color the
-    // effect would have been on rather than restarting it.
-    switch (effectMode) {
-        case EFFECT_LOOP:
-            fx.phase %= LOOP_LEG_MS * fx.colorCount;
-            renderLoop(fx, LOOP_LEG_MS);
-            break;
-        case EFFECT_FLICKER:
-            renderFlicker(fx, now);
-            break;
-        case EFFECT_NEON:
-            fx.phase %= NEON_LEG_MS * fx.colorCount;
-            renderNeon(fx, NEON_LEG_MS, NEON_FADE_MS);
-            break;
-        case EFFECT_BLEND:
-        default:
-            fx.phase %= BLEND_MS * fx.colorCount;
-            renderBlend(fx, BLEND_MS);
-            break;
+    // The effect renders whatever the lamp is doing, so power and the overlays
+    // only decide what reaches the LEDs. Switching back on shows where the
+    // sequence is now, which is where every other lamp is too.
+    CHSV px[NUM_LEDS];
+    Layer &cur = layers[current];
+    renderSequence(cur.seq, clockMs, now, cur.flicker, px, NUM_LEDS);
+
+    if (fading && clockMs >= fadeStart) {
+        Layer &next = layers[current ^ 1];
+        CHSV in[NUM_LEDS];
+        renderSequence(next.seq, clockMs, now, next.flicker, in, NUM_LEDS);
+        uint64_t into = clockMs - fadeStart;
+        if (into >= fadeMs) {
+            current ^= 1;
+            fading = false;
+            for (uint8_t i = 0; i < NUM_LEDS; i++) px[i] = in[i];
+        } else {
+            uint8_t frac = ease8InOutCubic((uint8_t)((into * 255U) / fadeMs));
+            for (uint8_t i = 0; i < NUM_LEDS; i++) px[i] = blendHsv(px[i], in[i], frac);
+        }
     }
-
+    for (uint8_t i = 0; i < NUM_LEDS; i++) leds[i] = px[i];
 
     // Expire the overlays. timeReached() rather than a plain compare: an
     // absolute deadline test strands them for 49.7 days if the loop blocks
@@ -355,11 +558,20 @@ static void loopLeds() {
         alerting = false;
         ESP_LOGI(TAG, "alert over");
     }
+    if (pulsing && now - pulseStart >= pulseMs) pulsing = false;
 
     // One decision about brightness per frame, made here rather than by
-    // whichever overlay started last. Both of them override what someone chose,
+    // whichever overlay started last. They all override what someone chose,
     // and they can overlap.
     uint8_t want = brightness;
+    if (pulsing && power && pulseLevel > want) {
+        // Straight to the peak, then eased back down: the cubic holds near
+        // the top for a moment before falling, which is what makes it read as
+        // a pulse rather than a flicker.
+        uint8_t frac = (uint8_t)(((uint64_t)(now - pulseStart) * 255U) / pulseMs);
+        uint8_t left = (uint8_t)(255 - ease8InOutCubic(frac));
+        want = (uint8_t)(want + scale8((uint8_t)(pulseLevel - want), left));
+    }
     if (identifying && want < IDENTIFY_MIN_BRIGHTNESS) want = IDENTIFY_MIN_BRIGHTNESS;
     if (alerting) want = ALERT_BRIGHTNESS;
     if (want != appliedBrightness) {
@@ -410,16 +622,14 @@ void setup() {
     setupLogBuffer();
 
     FastLED.addLeds<WS2812B, DATA_PIN, GRB>(leds, NUM_LEDS);
-    FastLED.setMaxPowerInVoltsAndMilliamps(5, 500);  // volts, mA
+    // 1 A: what the USB supply provides. Eight LEDs top out around 480 mA at
+    // full white, so this is a safety net for a bigger ring, not a dimmer.
+    FastLED.setMaxPowerInVoltsAndMilliamps(5, 1000);  // volts, mA
     FastLED.clear(true);
 
-    fx.leds = leds;
-    fx.numLeds = NUM_LEDS;
-    resetLampEffect();
-
     Serial.println("\n=== Glow Lamp " FIRMWARE_VERSION " ===");
-    ESP_LOGI(TAG, "%d LEDs on pin %d, %d effects, %d default colors", NUM_LEDS, DATA_PIN,
-             EFFECT_COUNT, DEFAULT_PALETTE_SIZE);
+    ESP_LOGI(TAG, "%d LEDs on pin %d, %d sequences, %d custom effects", NUM_LEDS, DATA_PIN,
+             SEQUENCE_COUNT, EFFECT_COUNT);
 
     // Brightness and the power state come out of NVS, so setupWifiLink()
     // (which calls settings.begin()) has to run before they are applied. A lamp
@@ -427,6 +637,12 @@ void setup() {
     setupWifiLink();
     setLampBrightness(settings.brightness());
     setLampPower(settings.power());
+    // No fade at boot: there is nothing on the ring to fade from.
+    setLampBreatheColor(settings.breatheColor());
+    // Stored by name, so a sequence removed in a later build falls back to the
+    // first one rather than to whatever took its index.
+    uint8_t seq = findSequence(settings.sequence().c_str());
+    setLampSequence(seq < SEQUENCE_COUNT ? seq : 0, 0);
     setupMqtt();
 }
 

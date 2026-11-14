@@ -159,7 +159,7 @@ These are the light's effect list in Home Assistant. See
 ### Pulse
 
 A 750 ms flash for Home Assistant to fire on an event: the ring dips, rises,
-flashes full white for three frames and snaps back. Visible at any brightness.
+flashes half its LEDs white for one frame and snaps back. Visible at any brightness.
 Ignored by a lamp that is off.
 
 ```sh

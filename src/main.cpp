@@ -40,7 +40,7 @@ static const uint32_t DEFAULT_BREATHE_RGB = 0x0080ff;
 //
 //   dip      down to a fifth of the current brightness   40% of the lead-in
 //   rise     back up past it to the peak, accelerating   60% of the lead-in
-//   peak     full brightness AND full white               PULSE_PEAK_FRAMES
+//   peak     full brightness, half the LEDs full white   PULSE_PEAK_FRAMES
 //   return   back to the color and brightness it had      PULSE_RETURN_MS
 //
 // The lead-in is whatever the total leaves after peak and return. The dip is
@@ -49,13 +49,18 @@ static const uint32_t DEFAULT_BREATHE_RGB = 0x0080ff;
 // 255: a saturated color lights one or two of each LED's channels, white
 // lights all three. Nothing is saved.
 //
+// Only every other LED goes white. Behind the diffuser four white LEDs and
+// four colored ones read as a bright flash of the sequence's color, where all
+// eight read as the lamp briefly turning into a white bulb. Settled by eye in
+// the pulse simulator against full white, no white and the old pulse.
+//
 // The peak is counted in frames, not ms, because a frame is the unit the eye
-// actually gets: three of them (48 ms) is long enough to register as a flash
-// without settling into a glow.
+// actually gets. One frame (16 ms), with half the ring white, is a spark: seen,
+// then gone.
 static const uint32_t PULSE_DEFAULT_MS = 750;
 static const uint32_t PULSE_MIN_MS = 300;
 static const uint32_t PULSE_MAX_MS = 5000;
-static const uint32_t PULSE_PEAK_FRAMES = 3;
+static const uint32_t PULSE_PEAK_FRAMES = 1;
 static const uint32_t PULSE_RETURN_MS = 75;
 static const uint8_t PULSE_DIP_PERCENT = 40;  // of the lead-in; the rise gets the rest
 static const uint8_t PULSE_DIP_FLOOR = 51;    // fraction of brightness at the bottom, /255
@@ -614,9 +619,10 @@ static void loopLeds() {
     if (pulseShowing) {
         pulseFrame(now - pulseStart, brightness, pulseBright, pulseWhite);
         if (pulseWhite) {
-            // Desaturating keeps value: s=0, v=255 is full white.
+            // Desaturating keeps value: s=0, v=255 is full white. Even LEDs
+            // only -- every other one keeps the sequence color.
             uint8_t keep = (uint8_t)(255 - pulseWhite);
-            for (uint8_t i = 0; i < NUM_LEDS; i++) {
+            for (uint8_t i = 0; i < NUM_LEDS; i += 2) {
                 px[i].s = scale8(px[i].s, keep);
                 px[i].v = qadd8(px[i].v, scale8((uint8_t)(255 - px[i].v), pulseWhite));
             }

@@ -52,7 +52,7 @@ int32_t lampAlertRemaining();
 // ===== Pulse =====
 //
 // A flash for Home Assistant to fire on an event: a dip, a rise to `level` (0
-// means full) climaxing in a moment of full white, and a quick return to the
+// means full) climaxing in one frame with every other LED full white, and a quick return to the
 // color and brightness the lamp had. `ms` is the whole thing (0 means the
 // default, 750 ms; clamped to 300-5000). Nothing is saved. Visible at any
 // brightness, including 255 -- the dip and the white do that.

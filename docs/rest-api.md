@@ -116,8 +116,8 @@ curl -X POST http://lamp.local/api/pulse
 curl -X POST 'http://lamp.local/api/pulse?ms=1000&brightness=200'
 ```
 
-A dip, a rise to `brightness` (default 255) that peaks in a three-frame white
-flash, and a quick return — `ms` in all (default 750, 300–5000). Nothing is
+A dip, a rise to `brightness` (default 255) that peaks in a one-frame flash
+with every other LED white, and a quick return — `ms` in all (default 750, 300–5000). Nothing is
 saved. Ignored while the lamp is off. The REST twin of the MQTT pulse topics;
 the phases are in [mqtt.md](mqtt.md#subscribe-glowlamphostnamepulse-and-glowlampallpulse).
 

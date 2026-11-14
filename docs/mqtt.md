@@ -301,14 +301,16 @@ saved; the lamp goes straight back to what it was showing.
 
 | Phase | Time (default 750 ms) | What the ring does |
 |---|---|---|
-| Dip | 250 ms | Dims to a fifth of its brightness |
-| Rise | 377 ms | Climbs to the peak, slowly then fast, turning towards white near the top |
-| Peak | 48 ms | Full brightness, **full white** — three frames |
+| Dip | 263 ms | Dims to a fifth of its brightness |
+| Rise | 396 ms | Climbs to the peak, slowly then fast, half the LEDs turning towards white near the top |
+| Peak | 16 ms | Full brightness, **every other LED full white** — one frame |
 | Return | 75 ms | Back to its color and brightness |
 
 The dip and the white are what make it visible at any brightness, 255 included.
 A saturated color lights one or two of each LED's channels; white lights all
-three, so the flash outshines anything a sequence can show. `ms` stretches the
+three, so the flash outshines anything a sequence can show. Only four of the
+eight LEDs go white, so the flash still reads as the sequence's color rather
+than as a white bulb. `ms` stretches the
 dip and rise; the peak and the return stay fixed.
 
 ```sh
